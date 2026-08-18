@@ -7,13 +7,14 @@ from memory import init_memory
 from orchestrator_agent import orchestrator_agent
 from qdrant_vector_database import close_qdrant_client, ingest_documents
 
-def initialize_app(pdf_dir: Path) -> None:
+def initialize_app(pdf_dir: Path) -> dict:
     init_memory()
     print("Ingesting documents...")
     info = ingest_documents(pdf_dir)
     print(
         f"{info['num_pdfs']} PDFs ingested to Qdrant collection {info['collection_name']}"
     )
+    return info
 
 def chat_with_supervisor(session_id: str | None = None) -> None:
     if session_id is None:

@@ -1,4 +1,6 @@
 import atexit
+import logging
+import os
 from functools import lru_cache
 import json
 from pathlib import Path
@@ -170,15 +172,40 @@ COLLECTION_NAME = "document_reports"
 OVERSAMPLE_FACTOR = 8
 MIN_FETCH_LIMIT = 20
 
-EMBEDDING_MODELS = {
-    "small": {"name": "text-embedding-3-small", "size": 1536},
-    "large": {"name": "text-embedding-3-large", "size": 3072},
+# Embedding model configuration from environment variables with type hints
+EmbeddingConfig = dict[str, str]
+embedding_config: EmbeddingConfig = {
+    "endpoint": os.getenv("EMBEDDING_ENDPOINT", ""),
+    "model": os.getenv("EMBEDDING_MODEL", "nomicai-modernbert-embed-base-bf16"),
+    "api_key": os.getenv("EMBEDDING_API_KEY", ""),
 }
-EMBEDDING_MODEL_KEY = "small"
-EMBEDDING_MODEL_NAME = EMBEDDING_MODELS[EMBEDDING_MODEL_KEY]["name"]
-EMBEDDING_VECTOR_SIZE = EMBEDDING_MODELS[EMBEDDING_MODEL_KEY]["size"]
 
-embedding_model = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
+EMBEDDING_MODEL_NAME = embedding_config["model"]
+EMBEDDING_ENDPOINT = embedding_config["endpoint"].rstrip("/")
+EMBEDDING_API_KEY = embedding_config["api_key"]
+
+# Determine vector size based on model name (default to ModernBert size if unknown)
+if "modernbert" in EMBEDDING_MODEL_NAME.lower():
+    EMBEDDING_VECTOR_SIZE = 768  # ModernBert embed base size
+else:
+    # Fallback to OpenAI sizes if using different model
+    EMBEDDING_VECTOR_SIZE = 1536  # Default to text-embedding-3-small size
+
+# Log embedding configuration for debugging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.info(f"Using embedding model: {EMBEDDING_MODEL_NAME}")
+logger.info(f"Embedding endpoint: {EMBEDDING_ENDPOINT}")
+
+# Create embedding model using environment variables
+# For local LLMs (Ollama, LM Studio), API key can be empty or dummy
+# Note: check_embedding_ctx_length=False prevents tokenization issues with LocalAI API
+embedding_model = OpenAIEmbeddings(
+    model=EMBEDDING_MODEL_NAME,
+    openai_api_key=EMBEDDING_API_KEY if EMBEDDING_API_KEY and EMBEDDING_API_KEY != "your_embedding_api_key_here" else "dummy",
+    openai_api_base=EMBEDDING_ENDPOINT + "/" if not EMBEDDING_ENDPOINT.endswith("/") else EMBEDDING_ENDPOINT,
+    check_embedding_ctx_length=False,
+)
 
 
 # create vector embeddings and qdrant payloads for chunks

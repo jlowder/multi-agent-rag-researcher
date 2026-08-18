@@ -1,6 +1,6 @@
 from datetime import datetime
 import json
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from memory import (
     build_evidence_context,
     get_session_context,
@@ -13,6 +13,7 @@ from worker_agents import (
     verifier_agent,
     writer_agent,
 )
+
 """
 Orchestrator 
 =====================================================================================
@@ -161,8 +162,6 @@ ORCHESTRATOR_INSTRUCTIONS = (
     - Return the verifier output when available.
     """
 )
-ORCHESTRATOR_MODEL = "gpt-5.4-mini"
-ORCHESTRATOR_REASONING_EFFORT = "low"
 
 # Format the current orchestration state for the model.
 def build_orchestrator_prompt_context(state: dict[str, Any]) -> str:
@@ -197,7 +196,22 @@ def orchestrator_agent(
     user_query: str,
     session_id: str = "default",
     verbose: bool = True,
+    endpoint: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Execute the orchestrator agent.
+    
+    Args:
+        user_query: The user's query to orchestrate
+        session_id: Session ID for memory persistence
+        verbose: Whether to print debug information
+        endpoint: Optional custom endpoint URL
+        api_key: Optional custom API key
+        
+    Returns:
+        Dict with the orchestration state and results
+    """
     
     # Load session context for follow-up questions and cached evidence reuse.
     session_context = get_session_context(session_id)
@@ -222,13 +236,15 @@ def orchestrator_agent(
 
     response = run_model(
         instructions=ORCHESTRATOR_INSTRUCTIONS,
-        model=ORCHESTRATOR_MODEL,
-        reasoning_effort=ORCHESTRATOR_REASONING_EFFORT,
+        reasoning_effort="low",
         input_data=(
             f"User query: {user_query}\n\n"
             f"Current state:\n{build_orchestrator_prompt_context(state)}"
         ),
         tools=ORCHESTRATOR_TOOL_SCHEMAS,
+        agent_name="orchestrator",
+        endpoint=endpoint,
+        api_key=api_key,
     )
 
     # Allow up to 4 orchestration rounds before stopping.
@@ -330,8 +346,7 @@ def orchestrator_agent(
 
         response = run_model(
             instructions=ORCHESTRATOR_INSTRUCTIONS,
-            model=ORCHESTRATOR_MODEL,
-            reasoning_effort=ORCHESTRATOR_REASONING_EFFORT,
+            reasoning_effort="low",
             input_data=[
                 *tool_outputs,
                 {
