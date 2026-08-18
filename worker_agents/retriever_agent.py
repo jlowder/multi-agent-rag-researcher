@@ -89,9 +89,6 @@ def web_search(query: str, num_results: int = 5) -> Dict[str, Any]:
         return {"query": query, "results": []}
 
 
-RETRIEVER_MODEL = "gpt-5.4-mini"
-RETRIEVER_REASONING_EFFORT = "low"
-
 # Guides the retriever agent on how to interact with the available tools
 # (document retrieval and web search).
 RETRIEVER_TOOL_SCHEMAS = [
@@ -178,8 +175,22 @@ def retriever_agent(
     *,
     last_user_query: str = "",
     verbose: bool = False,
+    endpoint: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> ResearchEvidencePack:
+    """
+    Execute the retriever agent.
     
+    Args:
+        user_query: The user's query to retrieve evidence for
+        last_user_query: The previous user query for context
+        verbose: Whether to print debug information
+        endpoint: Optional custom endpoint URL
+        api_key: Optional custom API key
+        
+    Returns:
+        ResearchEvidencePack with the retrieved evidence
+    """
     previous_response_id: Optional[str] = None
 
     # Expose indexed document titles so the model can judge whether the PDFs
@@ -203,10 +214,12 @@ def retriever_agent(
         response = run_model(
             instructions=RETRIEVER_INSTRUCTIONS,
             input_data=pending_input,
-            model=RETRIEVER_MODEL,
             tools=RETRIEVER_TOOL_SCHEMAS,
             previous_response_id=previous_response_id,
-            reasoning_effort=RETRIEVER_REASONING_EFFORT,
+            reasoning_effort="low",
+            agent_name="retriever",
+            endpoint=endpoint,
+            api_key=api_key,
         )
         previous_response_id = response.id
 

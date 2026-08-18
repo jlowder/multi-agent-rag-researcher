@@ -1,7 +1,5 @@
 from .model_runner import run_model
-
-WRITER_MODEL = "gpt-5.4"
-WRITER_REASONING_EFFORT = "low"
+from typing import Optional
 
 """
 Writer Agent 
@@ -10,7 +8,26 @@ It used by the Orchestrator to write a report on the retrieved information
 from the retriever agent.
 Main role is to draft a clear, grounded response from the evidence it receives.
 """
-def writer_agent(user_query: str, evidence_text: str, verbose: bool = False) -> str:
+def writer_agent(
+    user_query: str,
+    evidence_text: str,
+    verbose: bool = False,
+    endpoint: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> str:
+    """
+    Execute the writer agent.
+    
+    Args:
+        user_query: The user's original query
+        evidence_text: The evidence to base the report on
+        verbose: Whether to print debug information
+        endpoint: Optional custom endpoint URL
+        api_key: Optional custom API key
+        
+    Returns:
+        The written report as a string
+    """
     if verbose:
         print("[Writer Agent] Writing report...")
 
@@ -42,8 +59,10 @@ def writer_agent(user_query: str, evidence_text: str, verbose: bool = False) -> 
     response = run_model(
         instructions=instructions,
         input_data=input_text,
-        model=WRITER_MODEL,
-        reasoning_effort=WRITER_REASONING_EFFORT,
+        reasoning_effort="low",
         tools=None,
+        agent_name="writer",
+        endpoint=endpoint,
+        api_key=api_key,
     )
     return response.output_text

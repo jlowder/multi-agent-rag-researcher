@@ -114,8 +114,8 @@ Note: The orchestrator has a guardrail that keeps the system focused on research
 ### Prerequisites
 
 - Python 3.10 or newer
-- OpenAI API key
 - Tavily API key
+- For local LLMs: Ollama, LocalAI, or LM Studio installed and running
 
 ### Installation
 
@@ -140,22 +140,48 @@ pip3 install -r utils/requirements.txt
 pip3 install langchain-openai
 ```
 
-4. Create a `utils/var.env` file and store your API keys:
+4. Create a `utils/var.env` file with your API keys:
 
 ```env
-OPENAI_API_KEY=your_openai_api_key
+# For OpenAI (default)
+LLM_ENDPOINT=https://api.openai.com/v1
+LLM_API_KEY=your_openai_api_key
+
+# For local LLMs (Ollama example)
+# LLM_ENDPOINT=http://localhost:11434/v1
+# LLM_API_KEY=n/a
+
 TAVILY_API_KEY=your_tavily_api_key
 ```
+
+**Note:** See [LOCAL_LLM_SETUP.md](LOCAL_LLM_SETUP.md) for comprehensive configuration examples for Ollama, LocalAI, LM Studio, and other OpenAI-compatible services.
 
 5. Place the PDFs you want to index in the `docs/` folder, or upload PDFs later through the UI. The project already includes existing PDFs in `docs/`, currently `Gemma 3 Technical Report.pdf` and `DeepSeek-V3.2.pdf`, so you can use those directly or replace them with your own documents.
 
 ## Run Project
 
-Start the command-line app:
+### With OpenAI (Default)
+
+No configuration needed. The system uses default OpenAI settings.
 
 ```bash
 python3 run_orchestrator.py
 ```
+
+### With Local LLMs
+
+Set the environment variables before running:
+
+```bash
+# Ollama example
+export LLM_ENDPOINT=http://localhost:11434/v1
+export LLM_MODEL=llama3.1:8b
+export LLM_API_KEY=n/a
+
+python3 run_orchestrator.py
+```
+
+See [LOCAL_LLM_SETUP.md](LOCAL_LLM_SETUP.md) for configuration examples for Ollama, LocalAI, LM Studio, and other OpenAI-compatible services.
 
 When the CLI starts, it ingests the PDFs in `docs/` into the local Qdrant store. Type `q` or `exit` to end the session.
 

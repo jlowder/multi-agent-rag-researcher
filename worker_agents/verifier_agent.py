@@ -1,7 +1,5 @@
 from .model_runner import run_model
-
-VERIFIER_MODEL = "gpt-5.4"
-VERIFIER_REASONING_EFFORT = "low"
+from typing import Optional
 
 """
 Verifier Agent
@@ -17,7 +15,23 @@ def verifier_agent(
     written_draft: str,
     evidence_text: str,
     verbose: bool = False,
+    endpoint: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> str:
+    """
+    Execute the verifier agent.
+    
+    Args:
+        user_query: The user's original query
+        written_draft: The draft report to verify
+        evidence_text: The evidence to verify against
+        verbose: Whether to print debug information
+        endpoint: Optional custom endpoint URL
+        api_key: Optional custom API key
+        
+    Returns:
+        The verified report as a string
+    """
     if verbose:
         print("[Verifier Agent] Verifying report...")
 
@@ -54,8 +68,10 @@ def verifier_agent(
     response = run_model(
         instructions=instructions,
         input_data=input_text,
-        model=VERIFIER_MODEL,
-        reasoning_effort=VERIFIER_REASONING_EFFORT,
+        reasoning_effort="low",
         tools=None,
+        agent_name="verifier",
+        endpoint=endpoint,
+        api_key=api_key,
     )
     return response.output_text
