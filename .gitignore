@@ -206,3 +206,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+docs
+utils/var.env
+utils/qdrant_storage
+utils/indexed_documents.json
+utils/memory.db
+

@@ -32,6 +32,12 @@ class ResearchEvidencePack(BaseModel):
 
 
 # Retrieve relevant document evidence for a query.
+# Maximum characters to retain per retrieved document chunk.
+# PDF page content can easily be 2000-8000+ chars; we cap it to keep
+# the LLM context window manageable when accumulated across iterations.
+_CHUNK_CONTENT_MAX_CHARS = 800
+
+
 def retrieve_document(
     query: str,
     per_doc_topk: int = 4,
@@ -49,6 +55,12 @@ def retrieve_document(
             "summary": f"Document retrieval failed: {type(exc).__name__}",
             "chunks": [],
         }
+
+    def _truncate(text: str) -> str:
+        if not text:
+            return text
+        return text[:_CHUNK_CONTENT_MAX_CHARS]
+
     return {
         "query": query,
         "summary": (
@@ -63,7 +75,7 @@ def retrieve_document(
                 "page_number": int(item["page_number"]),
                 "chunk_id": item["chunk_id"],
                 "citation": item["citation"],
-                "content": item["content"],
+                "content": _truncate(item["content"]),
                 "score": float(item["score"]),
             }
             for item in results
@@ -71,6 +83,12 @@ def retrieve_document(
     }
 
 # Search the web for supporting context.
+# Maximum characters to retain per web search result content.
+# Tavily can return 3-15KB of raw HTML/Markdown per result; we cap it
+# so accumulated results across iterations stay within the context window.
+_WEB_RESULT_CONTENT_MAX_CHARS = 600
+
+
 def web_search(query: str, num_results: int = 5) -> Dict[str, Any]:
     if tavily is None:
         return {"query": query, "results": []}
@@ -84,7 +102,17 @@ def web_search(query: str, num_results: int = 5) -> Dict[str, Any]:
             include_raw_content=True,
             include_images=False,
         )
-        return {"query": query, "results": result.get("results", [])}
+        results = result.get("results", [])
+
+        def _truncate_result(r: Dict[str, Any]) -> Dict[str, Any]:
+            """Truncate raw_content/content fields to bound token usage."""
+            for key in ("raw_content", "content"):
+                val = r.get(key)
+                if val and isinstance(val, str):
+                    r[key] = val[:_WEB_RESULT_CONTENT_MAX_CHARS]
+            return r
+
+        return {"query": query, "results": [_truncate_result(r) for r in results]}
     except Exception:
         return {"query": query, "results": []}
 

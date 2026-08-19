@@ -246,31 +246,38 @@ def reset_collection(client: QdrantClient) -> None:
 
 # ingest pdf documents into qdrant and save document catalog
 def ingest_documents(pdf_dir: Path) -> dict:
+    proceed = True
+    document_chunks = []
+
     if not pdf_dir.exists():
-        raise FileNotFoundError(f"PDF directory not found: {pdf_dir}")
+        print(f"PDF directory not found: {pdf_dir}")
+        proceed = False
 
     pdf_paths = sorted(pdf_dir.glob("*.pdf"))
     if not pdf_paths:
-        raise ValueError(f"No PDFs found in {pdf_dir}")
+        print(f"No PDFs found in {pdf_dir}")
+        proceed = False
 
     documents, catalog = build_document_catalog(pdf_paths)
     if not documents:
-        raise ValueError(f"Unable to load PDFs from {pdf_dir}")
+        print(f"Unable to load PDFs from {pdf_dir}")
+        proceed = False
 
-    document_chunks = chunk_documents(documents)
-    client = get_qdrant_client()
-    reset_collection(client)
+    if proceed:
+        document_chunks = chunk_documents(documents)
+        client = get_qdrant_client()
+        reset_collection(client)
 
-    document_embeddings = create_document_embeddings(document_chunks)
-    for index in range(0, len(document_embeddings), 128):
-        batch = document_embeddings[index:index + 128]
-        client.upsert(
-            collection_name=COLLECTION_NAME,
-            points=batch,
-            wait=True,
-        )
+        document_embeddings = create_document_embeddings(document_chunks)
+        for index in range(0, len(document_embeddings), 128):
+            batch = document_embeddings[index:index + 128]
+            _ = client.upsert(
+                collection_name=COLLECTION_NAME,
+                points=batch,
+                wait=True,
+            )
 
-    save_indexed_document_catalog(catalog)
+        save_indexed_document_catalog(catalog)
 
     return {
         "num_pdfs": len(pdf_paths),
