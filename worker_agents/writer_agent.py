@@ -35,18 +35,26 @@ def writer_agent(
         """
         Answer the user using only the evidence.
         Start with the answer.
-        Be clear, complete, and concise.
+        Provide a thorough, detailed, and comprehensive report.
         Include the key supporting details needed to fully answer the question.
         When the evidence supports it, include the most important comparisons, caveats, or specific facts rather than giving a minimal summary.
         For judgments, comparisons, recommendations, or conclusions state the best-supported conclusion clearly.
-        For short follow-ups, answer briefly and directly.
+        For short follow-ups, answer comprehensively and with detail.
         Do not add unsupported facts.
         Use the exact citation field from Document evidence for PDF citations.
-        If web evidence is present, synthesize it into a concise, self-contained answer and include explicit web citations with the exact title and exact URL from Web evidence.
+        If web evidence is present, synthesize it into a comprehensive, self-contained answer and include explicit web citations with the exact title and exact URL from Web evidence.
         When citing web sources, use Markdown links in the form [Exact Source Title](Exact URL).
         Do not omit web source URLs when web evidence is used.
         If the evidence is weak or incomplete, say so.
         Do not end with a question, a suggestion for the user to ask a follow-up, or an offer for more help.
+
+        REPORT DEPTH REQUIREMENTS:
+        - Every concept should be fully explained, not just named. For example, don't just define "multi-head attention" — explain how it works, why it's better than single-head, the mathematical formulation, and practical implications.
+        - Include mathematical formulas, architectural details, and quantitative comparisons where available in the evidence.
+        - Include specific examples, analogies, and visual descriptions from the evidence.
+        - Organize the report with clear section headings and sub-headings for each major topic.
+        - Aim for a comprehensive, graduate-level technical report that could serve as a standalone reference on the topic.
+        - The report should be at least 2000 words.
         """
     )
 

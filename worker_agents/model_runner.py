@@ -190,7 +190,9 @@ def run_model(
         instructions=instructions,
         input=input_data,
         tools=tools or [],
-        tool_choice="auto",
+        # Force tool usage if tools are provided (prevents LLM from answering
+        # from training data instead of using retrieval tools)
+        tool_choice = "required" if tools else "auto",
         previous_response_id=previous_response_id,
         parallel_tool_calls=False,
     )

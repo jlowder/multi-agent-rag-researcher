@@ -40,7 +40,7 @@ _CHUNK_CONTENT_MAX_CHARS = 800
 
 def retrieve_document(
     query: str,
-    per_doc_topk: int = 4,
+    per_doc_topk: int = 8,
     score_threshold: Optional[float] = 0.2,
 ) -> Dict[str, Any]:
     try:
@@ -194,7 +194,8 @@ Rules:
 - If retrieve_document returns no relevant chunks and the user is not explicitly asking about the PDFs, call web_search before finishing.
 - If retrieve_document returns relevant chunks, do not call web_search unless newer or external evidence is still needed.
 - Use the last user query only when the current query is a follow-up that depends on it.
-- Avoid redundant tool calls unless a prior result was empty or clearly insufficient.
+- Evidence accumulates across rounds. Do NOT repeat queries that returned results in a prior round.
+- Vary your queries across rounds to gather complementary, non-redundant evidence. Search for related angles, specific sub-topics, and different aspects of the question.
 - After tool use, return a short retrieval summary, not a user-facing answer.
 """
 
@@ -261,20 +262,85 @@ def retriever_agent(
             break
 
         for call in function_calls:
-            query = json.loads(call.arguments)["query"].strip()
-
             if call.name == "retrieve_document":
+                try:
+                    args = json.loads(call.arguments)
+                    query = args.get("query", "").strip()
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    query = ""
+
+                if not query:
+                    query = last_user_query.strip()
+                if not query:
+                    query = user_query.strip()
+
+                if not query:
+                    print("[RETRIEVER] Skipping retrieve_document: no query found in arguments")
+                    continue
+
                 if verbose:
                     print("[Retriever Agent] Retrieving document evidence...")
-                function_response = retrieve_document(query)
+                function_response = retrieve_document(query, per_doc_topk=8)
                 if function_response.get("chunks"):
-                    document_evidence = function_response
-            else:
+                    if document_evidence is None:
+                        document_evidence = function_response
+                    else:
+                        # Accumulate: merge chunks, deduplicating by chunk_id
+                        existing_chunks = {
+                            c["chunk_id"] for c in document_evidence.get("chunks", [])
+                        }
+                        new_chunks = [
+                            c
+                            for c in function_response["chunks"]
+                            if c["chunk_id"] not in existing_chunks
+                        ]
+                        document_evidence["chunks"] = (
+                            document_evidence.get("chunks", []) + new_chunks
+                        )
+                        document_evidence["summary"] = (
+                            f"Accumulated {len(document_evidence['chunks'])} total chunks "
+                            f"across retrieval rounds."
+                        )
+            elif call.name == "web_search":
+                try:
+                    args = json.loads(call.arguments)
+                    query = args.get("query", "").strip()
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    query = ""
+
+                if not query:
+                    query = last_user_query.strip()
+                if not query:
+                    query = user_query.strip()
+
+                if not query:
+                    print("[RETRIEVER] Skipping web_search: no query found in arguments")
+                    continue
+
                 if verbose:
                     print("[Retriever Agent] Searching the web...")
                 function_response = web_search(query)
                 if function_response.get("results"):
-                    web_evidence = function_response
+                    if web_evidence is None:
+                        web_evidence = function_response
+                    else:
+                        # Accumulate: merge results, deduplicating by URL
+                        existing_urls = {
+                            r.get("url", "")
+                            for r in web_evidence.get("results", [])
+                        }
+                        new_results = [
+                            r
+                            for r in function_response["results"]
+                            if r.get("url", "") not in existing_urls
+                        ]
+                        web_evidence["results"] = (
+                            web_evidence.get("results", []) + new_results
+                        )
+                        web_evidence["summary"] = (
+                            f"Accumulated {len(web_evidence['results'])} total web "
+                            f"results across retrieval rounds."
+                        )
 
             tool_results.append(
                 {
