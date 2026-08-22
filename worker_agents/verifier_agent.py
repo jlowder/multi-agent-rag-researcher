@@ -1,5 +1,6 @@
 from .model_runner import run_model
 from typing import Any, Optional
+from memory import debug, info
 
 
 def parse_evidence_status(text: str) -> Optional[dict]:
@@ -10,48 +11,48 @@ def parse_evidence_status(text: str) -> Optional[dict]:
     try:
         # Find the content between the first and second ~~~ delimiters
         first_tilde = text.find('~~~')
-        print(f"[PARSER DEBUG] first_tilde found at: {first_tilde}")
+        debug(f" first_tilde found at: {first_tilde}")
         if first_tilde == -1:
             return None
 
         # Search for EVIDENCE_STATUS: after the first ~~~
         status_marker = text.find('EVIDENCE_STATUS:', first_tilde)
-        print(f"[PARSER DEBUG] EVIDENCE_STATUS: found at: {status_marker}")
+        debug(f" EVIDENCE_STATUS: found at: {status_marker}")
         if status_marker == -1:
             return None
 
         # Find the closing ~~~ (after the marker)
         close_tilde = text.find('~~~', status_marker)
-        print(f"[PARSER DEBUG] closing ~~~ found at: {close_tilde}")
+        debug(f" closing ~~~ found at: {close_tilde}")
         if close_tilde == -1:
             # No closing delimiter; take everything after marker
             block_text = text[status_marker:]
         else:
             block_text = text[status_marker:close_tilde]
 
-        print(f"[PARSER DEBUG] block_text ({len(block_text)} chars): {repr(block_text[:300])}")
+        debug(f" block_text ({len(block_text)} chars): {repr(block_text[:300])}")
 
         status: dict[str, Any] = {}
         lines = block_text.strip().split('\n')
-        print(f"[PARSER DEBUG] lines count: {len(lines)}")
+        debug(f" lines count: {len(lines)}")
 
         for i, line in enumerate(lines):
             stripped = line.strip()
             if not stripped:
-                print(f"[PARSER DEBUG] line {i}: SKIPPED (empty)")
+                debug(f" line {i}: SKIPPED (empty)")
                 continue
 
             # Strip leading bullet point if present
             content = stripped.lstrip('- ').strip()
 
-            print(f"[PARSER DEBUG] line {i}: '{stripped}' -> content: '{content}'")
+            debug(f" line {i}: '{stripped}' -> content: '{content}'")
 
             if content.startswith('confidence:'):
                 status['confidence'] = content.split(':', 1)[1].strip()
-                print(f"[PARSER DEBUG]   -> parsed confidence: {status['confidence']}")
+                debug(f"   -> parsed confidence: {status['confidence']}")
             elif content.startswith('coverage:'):
                 status['coverage'] = content.split(':', 1)[1].strip()
-                print(f"[PARSER DEBUG]   -> parsed coverage: {status['coverage']}")
+                debug(f"   -> parsed coverage: {status['coverage']}")
             elif content.startswith('gaps:'):
                 gap_text = content.split(':', 1)[1].strip()
                 # Handle various formats:
@@ -65,17 +66,17 @@ def parse_evidence_status(text: str) -> Optional[dict]:
                             for g in inner.split(',')
                             if g.strip()
                         ]
-                    print(f"[PARSER DEBUG]   -> parsed gaps (list): {status['gaps']}")
+                    debug(f"   -> parsed gaps (list): {status['gaps']}")
                 elif not gap_text or gap_text.lower() in ('none', 'n/a', 'no gaps', 'none significant', 'none identified'):
                     status['gaps'] = []
-                    print(f"[PARSER DEBUG]   -> parsed gaps (empty keyword): []")
+                    debug(f"   -> parsed gaps (empty keyword): []")
                 else:
                     status['gaps'] = [gap_text]
-                    print(f"[PARSER DEBUG]   -> parsed gaps (freeform): {status['gaps']}")
+                    debug(f"   -> parsed gaps (freeform): {status['gaps']}")
             elif content.startswith('re_retrieve:'):
                 val = content.split(':', 1)[1].strip().lower()
                 status['re_retrieve'] = val in ('true', 'yes', '1', 'yes please')
-                print(f"[PARSER DEBUG]   -> parsed re_retrieve: {status['re_retrieve']} (from '{val}')")
+                debug(f"   -> parsed re_retrieve: {status['re_retrieve']} (from '{val}')")
             elif content.startswith('suggested_queries:'):
                 query_text = content.split(':', 1)[1].strip()
                 if not query_text or query_text.lower() in ('none', 'n/a', 'no', 'none', 'none at this time'):
@@ -92,14 +93,14 @@ def parse_evidence_status(text: str) -> Optional[dict]:
                         ]
                 else:
                     status['suggested_queries'] = [query_text.strip('"').strip("'")]
-                print(f"[PARSER DEBUG]   -> parsed suggested_queries: {status['suggested_queries']}")
+                debug(f"   -> parsed suggested_queries: {status['suggested_queries']}")
             else:
-                print(f"[PARSER DEBUG]   -> UNMATCHED")
+                debug(f"   -> UNMATCHED")
 
-        print(f"[PARSER DEBUG] Final status dict: {status}")
+        debug(f" Final status dict: {status}")
         return status if status else None
     except Exception as e:
-        print(f"[PARSER DEBUG] Exception: {e}")
+        debug(f" Exception: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -136,7 +137,7 @@ def verifier_agent(
         The verified report as a string
     """
     if verbose:
-        print("[Verifier Agent] Verifying report...")
+        info("Verifier Agent: Verifying report...")
 
     instructions = (
         """

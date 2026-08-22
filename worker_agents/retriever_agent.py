@@ -361,6 +361,6 @@ def retriever_agent(
         query=user_query,
         route_used=route_used,
         summary=summary,
-        document_evidence=document_evidence if document_evidence and document_evidence.get("chunks") else None,
-        web_evidence=web_evidence if web_evidence and web_evidence.get("results") else None,
+        document_evidence=document_evidence if document_evidence and document_evidence.get("chunks") else {},
+        web_evidence=web_evidence if web_evidence and web_evidence.get("results") else {},
     )

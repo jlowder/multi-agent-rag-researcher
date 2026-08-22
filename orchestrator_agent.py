@@ -3,9 +3,11 @@ import json
 from typing import Any, Dict, Optional
 from memory import (
     build_evidence_context,
+    debug,
     get_session_context,
     save_evidence,
     save_last_user_query,
+    set_debug_mode,
 )
 from worker_agents import (
     retriever_agent,
@@ -232,6 +234,7 @@ def orchestrator_agent(
     user_query: str,
     session_id: str = "default",
     verbose: bool = True,
+    debug_enabled: bool = False,
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -241,13 +244,15 @@ def orchestrator_agent(
     Args:
         user_query: The user's query to orchestrate
         session_id: Session ID for memory persistence
-        verbose: Whether to print debug information
+        verbose: Whether to print user-facing trace output
+        debug_enabled: Whether to enable debug-level diagnostic output
         endpoint: Optional custom endpoint URL
         api_key: Optional custom API key
         
     Returns:
         Dict with the orchestration state and results
     """
+    set_debug_mode(debug_enabled)
     
     # Load session context for follow-up questions and cached evidence reuse.
     session_context = get_session_context(session_id)
@@ -347,15 +352,15 @@ def orchestrator_agent(
             elif name == "call_retriever_agent":
                 # DEBUG: log which branch will fire
                 if state["evidence_json"] and not state["needs_more_evidence"]:
-                    print("[ORCHESTRATOR DEBUG] call_retriever_agent → STEP 1 (evidence already active)")
+                    debug("call_retriever_agent → STEP 1 (evidence already active)")
                 elif state["needs_more_evidence"] and state["gap_queries"]:
-                    print("[ORCHESTRATOR DEBUG] call_retriever_agent → STEP 2 (gap re-retrieval)")
+                    debug("call_retriever_agent → STEP 2 (gap re-retrieval)")
                 elif state["needs_more_evidence"]:
-                    print("[ORCHESTRATOR DEBUG] call_retriever_agent → STEP 3 (gap flag, proceed)")
+                    debug("call_retriever_agent → STEP 3 (gap flag, proceed)")
                 elif state["retrieval_attempted"]:
-                    print("[ORCHESTRATOR DEBUG] call_retriever_agent → STEP 4 (already attempted)")
+                    debug("call_retriever_agent → STEP 4 (already attempted)")
                 else:
-                    print("[ORCHESTRATOR DEBUG] call_retriever_agent → STEP 5 (initial retrieval)")
+                    debug("call_retriever_agent → STEP 5 (initial retrieval)")
                 # STEP 1: If evidence is already active and no re-retrieval needed, proceed to writing
                 if state["evidence_json"] and not state["needs_more_evidence"]:
                     output = evidence_already_active
@@ -382,6 +387,9 @@ def orchestrator_agent(
                             new_ev_json = json.loads(output)
                         except (json.JSONDecodeError, TypeError):
                             print("[ORCHESTRATOR] Failed to parse retriever output as JSON, skipping merge")
+                            new_ev_json = {}
+                        # Guard against None values from json.loads
+                        if new_ev_json is None:
                             new_ev_json = {}
 
                         try:
@@ -415,8 +423,11 @@ def orchestrator_agent(
                             new_ev_json["route_used"] = "none"
 
                         # Merge document chunks (dedup by chunk_id)
-                        new_doc_chunks = new_ev_json.get("document_evidence", {}).get("chunks", [])
+                        new_doc_chunks = new_ev_json.get("document_evidence", {}).get("chunks", []) or []
                         existing_doc_evidence = existing_ev.setdefault("document_evidence", {"query": "", "chunks": []})
+                        if existing_doc_evidence is None:
+                            existing_doc_evidence = {"query": "", "chunks": []}
+                            existing_ev["document_evidence"] = existing_doc_evidence
                         existing_doc_ids = {c.get("chunk_id") for c in existing_doc_evidence.get("chunks", [])}
                         for chunk in new_doc_chunks:
                             if chunk.get("chunk_id") not in existing_doc_ids:
@@ -425,17 +436,10 @@ def orchestrator_agent(
                         # Merge web results (dedup by url)
                         new_web = new_ev_json.get("web_evidence", {}).get("results", []) or []
                         existing_web = existing_ev.setdefault("web_evidence", {"query": "", "results": []})
-                        # Handle case where existing_web is None or has results=None
                         if existing_web is None:
                             existing_web = {"query": "", "results": []}
                             existing_ev["web_evidence"] = existing_web
                         existing_web_urls = {r.get("url", "") for r in (existing_web.get("results") or [])}
-                        
-                        # Also handle document_evidence being None
-                        existing_doc_evidence = existing_ev.setdefault("document_evidence", {"query": "", "chunks": []})
-                        if existing_doc_evidence is None:
-                            existing_doc_evidence = {"query": "", "chunks": []}
-                            existing_ev["document_evidence"] = existing_doc_evidence
                         for result in new_web:
                             if result.get("url", "") not in existing_web_urls:
                                 existing_web["results"].append(result)
@@ -475,16 +479,16 @@ def orchestrator_agent(
                     # DEBUG: print the entire JSON structure to diagnose parsing
                     try:
                         parsed = json.loads(output)
-                        print(f"[ORCHESTRATOR DEBUG] evidence_pack.model_dump() keys: {list(parsed.keys())}")
-                        print(f"[ORCHESTRATOR DEBUG] document_evidence type: {type(parsed.get('document_evidence')).__name__}, value preview: {str(parsed.get('document_evidence'))[:300]}")
+                        debug(f"evidence_pack.model_dump() keys: {list(parsed.keys())}")
+                        debug(f"document_evidence type: {type(parsed.get('document_evidence')).__name__}, value preview: {str(parsed.get('document_evidence'))[:300]}")
                     except Exception as e:
-                        print(f"[ORCHESTRATOR DEBUG] Could not re-parse output: {e}")
+                        debug(f"Could not re-parse output: {e}")
 
                     # DEBUG: log what the retriever actually returned
-                    print(f"[ORCHESTRATOR DEBUG] Retriever returned: query='{evidence_pack.query}', route='{evidence_pack.route_used}', summary='{evidence_pack.summary[:100]}...'")
+                    debug(f"Retriever returned: query='{evidence_pack.query}', route='{evidence_pack.route_used}', summary='{evidence_pack.summary[:100]}...'")
                     doc_chunks = len(evidence_pack.document_evidence.get("chunks", [])) if evidence_pack.document_evidence else 0
                     web_results = len(evidence_pack.web_evidence.get("results", [])) if evidence_pack.web_evidence else 0
-                    print(f"[ORCHESTRATOR DEBUG] Retriever found: {doc_chunks} doc chunks, {web_results} web results")
+                    debug(f"Retriever found: {doc_chunks} doc chunks, {web_results} web results")
 
                     # Check evidence using the Pydantic model as source of truth
                     has_docs = bool(evidence_pack.document_evidence and evidence_pack.document_evidence.get("chunks"))
@@ -495,7 +499,7 @@ def orchestrator_agent(
                         state["evidence_json"] = output
                         state["cached_query"] = state["user_query"]
                         save_evidence(session_id, state["user_query"], output)
-                        print(f"[ORCHESTRATOR DEBUG] SET state['evidence_json'] length: {len(output)} chars")
+                        debug(f"SET state['evidence_json'] length: {len(output)} chars")
                         evidence_context = build_evidence_context(output)
                         state["cached_evidence_summary"] = evidence_context["summary"]
                     else:
@@ -517,9 +521,9 @@ def orchestrator_agent(
                 formatted_evidence = evidence_context["formatted_evidence"]
                 if name == "call_writer_agent":
                     if not formatted_evidence:
-                        print("[ORCHESTRATOR DEBUG] call_writer_agent → NO evidence (formatted_evidence empty)")
+                        debug("call_writer_agent → NO evidence (formatted_evidence empty)")
                     else:
-                        print(f"[ORCHESTRATOR DEBUG] call_writer_agent → HAS evidence (formatted_evidence length: {len(formatted_evidence)})")
+                        debug(f"call_writer_agent → HAS evidence (formatted_evidence length: {len(formatted_evidence)})")
                     if not formatted_evidence:
                         output = "Cannot write yet because no retrieval evidence has been activated."
                         # No evidence — skip to finish immediately
@@ -579,27 +583,27 @@ def orchestrator_agent(
                         parsed = parse_evidence_status(output)
                         print(f"[ORCHESTRATOR] Parsed evidence status: {parsed}")
                     # Parse gap status from verifier output
-                    print(f"[ORCHESTRATOR DEBUG] Verifier output length: {len(output)} chars")
-                    print(f"[ORCHESTRATOR DEBUG] Verifier output contains 'EVIDENCE_STATUS:': {'EVIDENCE_STATUS:' in output}")
-                    print(f"[ORCHESTRATOR DEBUG] Verifier output contains '~~~': {'~~~' in output}")
+                    debug(f"Verifier output length: {len(output)} chars")
+                    debug(f"Verifier output contains 'EVIDENCE_STATUS:': {'EVIDENCE_STATUS:' in output}")
+                    debug(f"Verifier output contains '~~~': {'~~~' in output}")
                     # Show last 500 chars of verifier output for debugging
                     if len(output) > 500:
-                        print(f"[ORCHESTRATOR DEBUG] Last 500 chars of verifier output:\n{output[-500:]}")
+                        debug(f"Last 500 chars of verifier output:\n{output[-500:]}")
                     else:
-                        print(f"[ORCHESTRATOR DEBUG] Full verifier output:\n{output}")
+                        debug(f"Full verifier output:\n{output}")
                     
                     parsed_status = parse_evidence_status(output)
                     
                     # If parser returned None, try to diagnose why
                     if not parsed_status:
-                        print(f"[ORCHESTRATOR DEBUG] parse_evidence_status returned None")
+                        debug("parse_evidence_status returned None")
                         # Quick manual check: try to find the block
                         start = output.find('EVIDENCE_STATUS:')
                         if start >= 0:
                             block = output[start:start+500]
-                            print(f"[ORCHESTRATOR DEBUG] Found EVIDENCE_STATUS block preview:\n{block[:500]}")
+                            debug(f"Found EVIDENCE_STATUS block preview:\n{block[:500]}")
                         else:
-                            print(f"[ORCHESTRATOR DEBUG] No EVIDENCE_STATUS: found anywhere in verifier output")
+                            debug("No EVIDENCE_STATUS: found anywhere in verifier output")
                     if parsed_status:
                         state["verification_status"] = parsed_status
                         
@@ -683,14 +687,14 @@ def orchestrator_agent(
         # Log tool outputs for debugging
         for to in tool_outputs:
             if isinstance(to, dict) and "output" in to:
-                print(f"[ORCHESTRATOR DEBUG] Tool output ({to['tool_name']}): {str(to['output'])[:200]}...")
+                debug(f"Tool output ({to['tool_name']}): {str(to['output'])[:200]}...")
 
         # Log what LLM returned this iteration
         if not function_calls:
-            print(f"[ORCHESTRATOR DEBUG] LLM returned NO tool calls. Output text: {response.output_text[:200]}")
+            debug(f"LLM returned NO tool calls. Output text: {response.output_text[:200]}")
         else:
             for fc in function_calls:
-                print(f"[ORCHESTRATOR DEBUG] LLM returned tool call: {fc.name} with {len(fc.arguments)} args")
+                debug(f"LLM returned tool call: {fc.name} with {len(fc.arguments)} args")
 
         response = run_model(
             instructions=ORCHESTRATOR_INSTRUCTIONS,

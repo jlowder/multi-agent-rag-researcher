@@ -15,7 +15,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from memory import init_memory
+from memory import init_memory, set_debug_mode
 from orchestrator_agent import orchestrator_agent
 from qdrant_vector_database import ingest_documents
 
@@ -152,6 +152,9 @@ def clear_chat(state: dict) -> tuple[list, dict, str]:
         source=state.get("source", ""),
         source_key=state.get("source_key", "docs"),
     )
+    # Preserve report fields on clear
+    next_state["last_report"] = state.get("last_report", "")
+    next_state["last_report_query"] = state.get("last_report_query", "")
     return [], next_state, status_text(next_state)
 
 
@@ -178,11 +181,25 @@ def ingest_uploaded_documents(
         yield history, state, status_text(state)
 
 
-def chat(message: str, history: list[dict] | None, state: dict, file_paths: list[str] | None):
+def handle_save_report(state: dict) -> str:
+    """Save the latest research report to a markdown file and return the path."""
+    report = state.get("last_report", "") or ""
+    query = state.get("last_report_query", "")
+    if not report.strip():
+        return "No report to save. Run a query first."
+    from memory.save_report import save_report
+    session_id = state.get("session_id", "default")
+    path = save_report(report, query=query, session_id=session_id)
+    return f"Report saved to: {path}"
+
+
+def chat(message: str, history: list[dict] | None, state: dict, file_paths: list[str] | None, debug: bool = False):
     message = (message or "").strip()
     if not message:
         yield "", history, state, status_text(state)
         return
+
+    set_debug_mode(debug)
 
     history = history or []
     logs = ""
@@ -223,6 +240,7 @@ def chat(message: str, history: list[dict] | None, state: dict, file_paths: list
                         message,
                         session_id=state["session_id"],
                         verbose=True,
+                        debug_enabled=debug,
                     )
             except Exception as exc:
                 result_box["error"] = exc
@@ -253,6 +271,9 @@ def chat(message: str, history: list[dict] | None, state: dict, file_paths: list
                             history.append({"role": "assistant", "content": result["final_answer"]})
                         else:
                             history[-1] = {"role": "assistant", "content": result["final_answer"]}
+                        # Store report for save button
+                        state["last_report"] = result.get("final_answer", "")
+                        state["last_report_query"] = message
                     yield "", history, state, status
                     return
 
