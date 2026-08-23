@@ -15,7 +15,7 @@ from worker_agents import (
     verifier_agent,
     writer_agent,
 )
-from worker_agents.verifier_agent import parse_evidence_status
+from utils.config import get_config
 
 """
 Orchestrator 
@@ -193,6 +193,16 @@ ORCHESTRATOR_INSTRUCTIONS = (
     """
 )
 
+# P0-9: nudge note appended to the orchestrator input when the model ignores
+# tool_choice="required" and returns raw text (thinking + hand-written
+# <function=...> XML) instead of a tool call.
+ORCHESTRATOR_NO_TOOL_CALL_NUDGE = (
+    "Your previous response did not include a valid tool call. You MUST respond "
+    "with exactly one tool call from the available tools (call_retriever_agent, "
+    "call_writer_agent, call_verifier_agent, reuse_cached_evidence, or "
+    "finish_research). Do not write prose, thinking, or XML."
+)
+
 # Format the current orchestration state for the model.
 def build_orchestrator_prompt_context(state: dict[str, Any]) -> str:
     evidence_context = build_evidence_context(state["evidence_json"])
@@ -254,6 +264,10 @@ def orchestrator_agent(
     """
     set_debug_mode(debug_enabled)
     
+    config = get_config()
+    orchestrator_effort = config.get_reasoning_effort("orchestrator")
+    orchestrator_max_output_tokens = config.get_max_output_tokens("orchestrator")
+    
     # Load session context for follow-up questions and cached evidence reuse.
     session_context = get_session_context(session_id)
     cached_evidence_json = session_context["cached_evidence_json"]
@@ -274,24 +288,33 @@ def orchestrator_agent(
         "verification_status": {},
         "needs_more_evidence": False,
         "gap_queries": [],
+        "short_draft": False,
         "re_retrieve_rounds": 0,
         "finish_reason": "",              # NEW: reason from finish_research call
         "final_answer": "",
     }
     evidence_already_active = "Evidence is already active for this turn; proceed to writing."
 
+    orchestrator_input = (
+        f"User query: {user_query}\n\n"
+        f"Current state:\n{build_orchestrator_prompt_context(state)}"
+    )
     response = run_model(
         instructions=ORCHESTRATOR_INSTRUCTIONS,
-        reasoning_effort="low",
-        input_data=(
-            f"User query: {user_query}\n\n"
-            f"Current state:\n{build_orchestrator_prompt_context(state)}"
-        ),
+        reasoning_effort=orchestrator_effort,
+        max_output_tokens=orchestrator_max_output_tokens,
+        input_data=orchestrator_input,
         tools=ORCHESTRATOR_TOOL_SCHEMAS,
         agent_name="orchestrator",
         endpoint=endpoint,
         api_key=api_key,
     )
+
+    # P0-9: track the last orchestrator call so a no-tool-call response can be
+    # retried exactly once with the nudge note appended to the same input.
+    last_input_data: Any = orchestrator_input
+    last_previous_response_id: Optional[str] = None
+    nudge_used = False
 
     # Allow up to 10 orchestration rounds before stopping.
     for _ in range(10):
@@ -309,11 +332,61 @@ def orchestrator_agent(
             print(f"{'='*60}")
         function_calls = [item for item in response.output if item.type == "function_call"]
 
-        # If the model does not request any tools, return its direct reply.
+        # P0-9: safe exit when the model ignores tool_choice="required" and
+        # returns raw text (thinking + hand-written <function=...> XML). The
+        # raw text is never used as the final answer: nudge once, then resolve
+        # the answer from the cleanest available state text.
         if not function_calls:
-            state["final_answer"] = response.output_text or "I couldn't find enough evidence to answer that."
+            raw_text = response.output_text or ""
+            print(
+                "[ORCHESTRATOR] WARNING: orchestrator returned text without a tool call: "
+                f"{raw_text[:200]}"
+            )
+            if not nudge_used:
+                nudge_used = True
+                if isinstance(last_input_data, str):
+                    nudge_input: Any = f"{last_input_data}\n\n{ORCHESTRATOR_NO_TOOL_CALL_NUDGE}"
+                else:
+                    nudge_input = list(last_input_data)
+                    for i in range(len(nudge_input) - 1, -1, -1):
+                        item = nudge_input[i]
+                        if isinstance(item, dict) and item.get("type") == "message":
+                            nudge_input[i] = {
+                                **item,
+                                "content": f"{item.get('content', '')}\n\n{ORCHESTRATOR_NO_TOOL_CALL_NUDGE}",
+                            }
+                            break
+                    else:
+                        nudge_input.append({"type": "message", "role": "user", "content": ORCHESTRATOR_NO_TOOL_CALL_NUDGE})
+                print("[ORCHESTRATOR] Retrying orchestrator call once with a tool-call nudge note.")
+                response = run_model(
+                    instructions=ORCHESTRATOR_INSTRUCTIONS,
+                    reasoning_effort=orchestrator_effort,
+                    max_output_tokens=orchestrator_max_output_tokens,
+                    input_data=nudge_input,
+                    tools=ORCHESTRATOR_TOOL_SCHEMAS,
+                    previous_response_id=last_previous_response_id,
+                    agent_name="orchestrator",
+                    endpoint=endpoint,
+                    api_key=api_key,
+                )
+                # Re-parse the retry output on the next loop pass.
+                continue
+            # Nudge already spent (or the retry also returned text): resolve
+            # the final answer from clean state text, never from raw text
+            # except as a last resort.
+            if state["verification"]:
+                state["final_answer"] = state["verification"]
+                answer_source = "verification"
+            elif state["written_draft"]:
+                state["final_answer"] = state["written_draft"]
+                answer_source = "draft"
+            else:
+                state["final_answer"] = raw_text or "I couldn't find enough evidence to answer that."
+                answer_source = "raw-text-fallback"
             if verbose:
                 print(f"[ORCHESTRATOR] EARLY RETURN: {state['final_answer'][:100]}")
+            print(f"[ORCHESTRATOR] final answer resolved from: {answer_source}")
             save_last_user_query(session_id, user_query)
             return state
 
@@ -428,6 +501,9 @@ def orchestrator_agent(
                         if existing_doc_evidence is None:
                             existing_doc_evidence = {"query": "", "chunks": []}
                             existing_ev["document_evidence"] = existing_doc_evidence
+                        # Ensure chunks key exists and is a list
+                        if "chunks" not in existing_doc_evidence or existing_doc_evidence["chunks"] is None:
+                            existing_doc_evidence["chunks"] = []
                         existing_doc_ids = {c.get("chunk_id") for c in existing_doc_evidence.get("chunks", [])}
                         for chunk in new_doc_chunks:
                             if chunk.get("chunk_id") not in existing_doc_ids:
@@ -439,6 +515,9 @@ def orchestrator_agent(
                         if existing_web is None:
                             existing_web = {"query": "", "results": []}
                             existing_ev["web_evidence"] = existing_web
+                        # Ensure results key exists and is a list
+                        if "results" not in existing_web or existing_web["results"] is None:
+                            existing_web["results"] = []
                         existing_web_urls = {r.get("url", "") for r in (existing_web.get("results") or [])}
                         for result in new_web:
                             if result.get("url", "") not in existing_web_urls:
@@ -547,11 +626,10 @@ def orchestrator_agent(
                         if verbose:
                             print(f"[ORCHESTRATOR] Writer output (first 200 chars): {output[:200]}")
                             print(f"[ORCHESTRATOR] Writer output length: {len(output)} chars")
-                        # Check if draft is too short — if so, flag for more evidence
-                        draft_length = len(state.get("written_draft", ""))
-                        if draft_length < 1500:
-                            if verbose:
-                                print(f"[ORCHESTRATOR] Draft too short ({draft_length} chars), will verify with depth check")
+                        # P0-8: feed the (formerly dead) length gate to the verifier's depth check
+                        state["short_draft"] = len(state.get("written_draft", "")) < 1500
+                        if verbose:
+                            print(f"[ORCHESTRATOR] Draft length: {len(state['written_draft'])} chars (short_draft={state['short_draft']})")
                         # If the writer produced almost nothing, evidence wasn't usable
                         if len(output.strip()) < 50:
                             if verbose:
@@ -571,82 +649,50 @@ def orchestrator_agent(
                 else:
                     if verbose:
                         print("[ORCHESTRATOR] Initializing Verifier Agent...")
-                    output = verifier_agent(
+                    # Route signal for the verifier's status dict (P0-2): computed
+                    # from the active evidence in state, not from text sniffing.
+                    try:
+                        active_ev = json.loads(state["evidence_json"]) if state.get("evidence_json") else {}
+                    except (json.JSONDecodeError, TypeError):
+                        active_ev = {}
+                    if not isinstance(active_ev, dict):
+                        active_ev = {}
+                    has_doc_evidence = bool((active_ev.get("document_evidence") or {}).get("chunks"))
+                    has_web_evidence = bool((active_ev.get("web_evidence") or {}).get("results"))
+
+                    # P0-3: verifier returns (clean_text, status_dict)
+                    output, verification_status = verifier_agent(
                         user_query=state["user_query"],
                         written_draft=state["written_draft"],
                         evidence_text=formatted_evidence,
                         verbose=verbose,
+                        has_doc_evidence=has_doc_evidence,
+                        has_web_evidence=has_web_evidence,
+                        short_draft=bool(state.get("short_draft", False)),
                     )
                     state["verification"] = output
+                    state["verification_status"] = verification_status
                     if verbose:
                         print(f"[ORCHESTRATOR] Verifier output (first 200 chars): {output[:200]}")
-                        parsed = parse_evidence_status(output)
-                        print(f"[ORCHESTRATOR] Parsed evidence status: {parsed}")
-                    # Parse gap status from verifier output
-                    debug(f"Verifier output length: {len(output)} chars")
-                    debug(f"Verifier output contains 'EVIDENCE_STATUS:': {'EVIDENCE_STATUS:' in output}")
-                    debug(f"Verifier output contains '~~~': {'~~~' in output}")
-                    # Show last 500 chars of verifier output for debugging
-                    if len(output) > 500:
-                        debug(f"Last 500 chars of verifier output:\n{output[-500:]}")
-                    else:
-                        debug(f"Full verifier output:\n{output}")
-                    
-                    parsed_status = parse_evidence_status(output)
-                    
-                    # If parser returned None, try to diagnose why
-                    if not parsed_status:
-                        debug("parse_evidence_status returned None")
-                        # Quick manual check: try to find the block
-                        start = output.find('EVIDENCE_STATUS:')
-                        if start >= 0:
-                            block = output[start:start+500]
-                            debug(f"Found EVIDENCE_STATUS block preview:\n{block[:500]}")
-                        else:
-                            debug("No EVIDENCE_STATUS: found anywhere in verifier output")
-                    if parsed_status:
-                        state["verification_status"] = parsed_status
-                        
-                        # Direct coverage safeguard: force re-retrieval when:
-                        # 1. Coverage is thin/moderate, OR
-                        # 2. The depth override detected thin evidence (always takes precedence)
-                        #    — the verifier is biased to say "comprehensive" on thin evidence
-                        
-                        cov = state["verification_status"].get('coverage', 'moderate')
-                        has_depth_override = '[DEPTH OVERRIDE' in output
-                        depth_override_triggered = False
-                        
-                        if cov in ('thin', 'moderate'):
-                            depth_override_triggered = True
-                            print(f"[ORCHESTRATOR] COVERAGE OVERRIDE: forcing re_retrieve=True (coverage={cov})")
-                        elif has_depth_override:
-                            # System detected thin evidence — trust the system over the LLM's inflated rating
-                            depth_override_triggered = True
-                            print(f"[ORCHESTRATOR] DEPTH OVERRIDE: forcing re_retrieve=True (system detected thin evidence)")
-                        
-                        if depth_override_triggered and not state["verification_status"].get('re_retrieve', False):
-                            state["verification_status"]['re_retrieve'] = True
-                            suggested = state["verification_status"].get('suggested_queries', [])
-                            if not suggested:
-                                suggested_queries = []
-                                if 'THIN EVIDENCE' in output:
-                                    suggested_queries.append('Search for deeper coverage: attention variants, optimization techniques, and broader applications')
-                                if 'SINGLE-SOURCE' in output:
-                                    suggested_queries.append('Search for additional documents or perspectives on the topic')
-                                if 'NO_WEB_SEARCH' in output:
-                                    suggested_queries.append('Use web_search to supplement document gaps with broader coverage')
-                                state["verification_status"]['suggested_queries'] = suggested_queries
-                        
-                        if parsed_status.get("re_retrieve") and state["re_retrieve_rounds"] < 2:
-                            state["needs_more_evidence"] = True
-                            state["gap_queries"] = parsed_status.get("suggested_queries", [])
-                            if verbose:
-                                print(f"[ORCHESTRATOR] Verifier flagged {len(parsed_status.get('gaps', []))} gaps. Triggering gap-driven re-retrieval.")
-                        else:
+                        print(f"[ORCHESTRATOR] Verification status: {verification_status}")
+                    debug(f"Verifier output length: {len(output)} chars (clean text, no EVIDENCE_STATUS block)")
+
+                    # P0-2/P0-3/P0-4: act ONLY on the verifier's re_retrieve bool.
+                    # Gap queries come only from the critic (no boilerplate
+                    # fallback, no coverage/depth substring overrides).
+                    if verification_status.get("re_retrieve") and state["re_retrieve_rounds"] < 2:
+                        gap_queries = list(verification_status.get("gap_queries", []))
+                        specific_queries = list(verification_status.get("specific_queries", []))
+                        if not gap_queries and not specific_queries:
+                            debug("[ORCHESTRATOR] re_retrieve requested but no specific gap queries — skipping")
                             state["needs_more_evidence"] = False
                             state["gap_queries"] = []
+                        else:
+                            state["needs_more_evidence"] = True
+                            state["gap_queries"] = specific_queries or gap_queries
+                            if verbose:
+                                print(f"[ORCHESTRATOR] Verifier flagged {len(gap_queries)} gaps. Triggering gap-driven re-retrieval.")
                     else:
-                        # Verifier returned without EVIDENCE_STATUS block — clear gap state
                         state["needs_more_evidence"] = False
                         state["gap_queries"] = []
 
@@ -696,20 +742,24 @@ def orchestrator_agent(
             for fc in function_calls:
                 debug(f"LLM returned tool call: {fc.name} with {len(fc.arguments)} args")
 
+        next_input_data = [
+            *tool_outputs,
+            {
+                "type": "message",
+                "role": "user",
+                "content": f"Updated state:\n{build_orchestrator_prompt_context(state)}",
+            },
+        ]
         response = run_model(
             instructions=ORCHESTRATOR_INSTRUCTIONS,
-            reasoning_effort="low",
-            input_data=[
-                *tool_outputs,
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": f"Updated state:\n{build_orchestrator_prompt_context(state)}",
-                },
-            ],
+            reasoning_effort=orchestrator_effort,
+            max_output_tokens=orchestrator_max_output_tokens,
+            input_data=next_input_data,
             tools=ORCHESTRATOR_TOOL_SCHEMAS,
             previous_response_id=response.id,
         )
+        last_input_data = next_input_data
+        last_previous_response_id = response.id
 
     if state["verification"]:
         state["final_answer"] = state["verification"]

@@ -100,6 +100,7 @@ def run_model(
     previous_response_id: Optional[str] = None,
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
     text_format: Any = None,
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -115,6 +116,8 @@ def run_model(
         previous_response_id: ID of previous response for multi-turn conversations
         model: Model name (uses agent-specific or default if not provided)
         reasoning_effort: Reasoning effort level (e.g., "low", "medium", "high")
+        max_output_tokens: Optional cap on model output length (Responses API
+            max_output_tokens); omitted from the request when None
         text_format: Optional Pydantic model for structured output
         endpoint: Custom endpoint URL (overrides default)
         api_key: Custom API key (overrides default)
@@ -138,6 +141,7 @@ def run_model(
     logger.info(f"  previous_response_id: {previous_response_id}")
     logger.info(f"  model (incoming): {model} (type: {type(model).__name__ if model is not None else 'NoneType'})")
     logger.info(f"  reasoning_effort: {reasoning_effort}")
+    logger.info(f"  max_output_tokens: {max_output_tokens}")
     logger.info(f"  text_format: {text_format}")
     logger.info(f"  endpoint: {endpoint}")
     logger.info(f"  api_key: {'***' if api_key else '(none)'}")
@@ -201,6 +205,10 @@ def run_model(
         request["reasoning"] = {"effort": reasoning_effort}
         logger.info(f"Added reasoning_effort: {reasoning_effort}")
     
+    if max_output_tokens is not None:
+        request["max_output_tokens"] = max_output_tokens
+        logger.info(f"Added max_output_tokens: {max_output_tokens}")
+    
     logger.info("=" * 80)
     logger.info("FINAL REQUEST DICT (about to send to API):")
     logger.info(f"  model: '{request['model']}' (type: {type(request['model']).__name__})")
@@ -212,6 +220,8 @@ def run_model(
     logger.info(f"  parallel_tool_calls: {request['parallel_tool_calls']}")
     if "reasoning" in request:
         logger.info(f"  reasoning: {request['reasoning']}")
+    if "max_output_tokens" in request:
+        logger.info(f"  max_output_tokens: {request['max_output_tokens']}")
     logger.info("=" * 80)
     
     if text_format is not None:

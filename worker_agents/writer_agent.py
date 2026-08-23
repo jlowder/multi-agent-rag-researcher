@@ -1,5 +1,6 @@
 from .model_runner import run_model
 from typing import Optional
+from utils.config import get_config
 
 """
 Writer Agent 
@@ -54,7 +55,18 @@ def writer_agent(
         - Include specific examples, analogies, and visual descriptions from the evidence.
         - Organize the report with clear section headings and sub-headings for each major topic.
         - Aim for a comprehensive, graduate-level technical report that could serve as a standalone reference on the topic.
-        - The report should be at least 2000 words.
+
+        REQUIRED OUTLINE (follow this two-step process):
+        - Step 1: Begin the report with a "## Report Outline" section listing the 7-8 "##" sections you will write. Use this default set, adapting section names to the topic when a better fit exists:
+          1. Definition & Background
+          2. Core Components & Mechanics
+          3. Major Variants & Alternative Approaches
+          4. Dynamics / Evaluation / Analysis
+          5. Applications
+          6. Tools & Ecosystem
+          7. Limitations & Open Problems
+          8. Synthesis
+        - Step 2: After the outline, write each section under its own "##" heading with at least 300 words of substance — concrete facts, mechanisms, comparisons, and examples grounded in the evidence, not filler.
         """
     )
 
@@ -64,10 +76,12 @@ def writer_agent(
         f"Evidence:\n{evidence_text}"
     )
 
+    config = get_config()
     response = run_model(
         instructions=instructions,
         input_data=input_text,
-        reasoning_effort="low",
+        reasoning_effort=config.get_reasoning_effort("writer"),
+        max_output_tokens=config.get_max_output_tokens("writer"),
         tools=None,
         agent_name="writer",
         endpoint=endpoint,

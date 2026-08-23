@@ -6,6 +6,7 @@ from memory import infer_route_used
 from qdrant_vector_database import get_indexed_document_catalog, similarity_search
 from .model_runner import run_model
 from tavily import TavilyClient
+from utils.config import get_config
 
 """
 Retriever Agent 
@@ -238,6 +239,7 @@ def retriever_agent(
     web_evidence: Optional[Dict[str, Any]] = None
     summary = ""
 
+    config = get_config()
     # Allow a few tool-call rounds before finalizing the retrieval summary.
     for _ in range(4):
         response = run_model(
@@ -245,7 +247,8 @@ def retriever_agent(
             input_data=pending_input,
             tools=RETRIEVER_TOOL_SCHEMAS,
             previous_response_id=previous_response_id,
-            reasoning_effort="low",
+            reasoning_effort=config.get_reasoning_effort("retriever"),
+            max_output_tokens=config.get_max_output_tokens("retriever"),
             agent_name="retriever",
             endpoint=endpoint,
             api_key=api_key,

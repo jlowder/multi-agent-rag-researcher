@@ -128,9 +128,15 @@ class Config:
     
     # Agent-specific defaults (reasoning effort, etc.)
     retriever_reasoning_effort: str = "low"
-    writer_reasoning_effort: str = "low"
-    verifier_reasoning_effort: str = "low"
+    writer_reasoning_effort: str = "medium"
+    verifier_reasoning_effort: str = "medium"
     orchestrator_reasoning_effort: str = "low"
+    
+    # Per-agent max output tokens (Responses API `max_output_tokens`)
+    retriever_max_output_tokens: int = 2000
+    writer_max_output_tokens: int = 16000
+    verifier_max_output_tokens: int = 16000
+    orchestrator_max_output_tokens: int = 2000
     
     # Cached clients
     _clients: Dict[str, Any] = field(default_factory=dict)
@@ -152,6 +158,10 @@ class Config:
     def get_reasoning_effort(self, agent_name: str) -> str:
         """Get reasoning effort for a specific agent."""
         return getattr(self, f"{agent_name}_reasoning_effort")
+    
+    def get_max_output_tokens(self, agent_name: str) -> int:
+        """Get the max output tokens for a specific agent."""
+        return getattr(self, f"{agent_name}_max_output_tokens")
 
 
 # Global config instance
@@ -188,6 +198,18 @@ def get_config() -> Config:
             orchestrator_endpoint=os.getenv("ORCHESTRATOR_ENDPOINT"),
             orchestrator_api_key=os.getenv("ORCHESTRATOR_API_KEY"),
             orchestrator_model=os.getenv("ORCHESTRATOR_MODEL"),
+            
+            # Per-agent reasoning effort (documented in get_env_example)
+            retriever_reasoning_effort=os.getenv("RETRIEVER_REASONING_EFFORT", "low"),
+            writer_reasoning_effort=os.getenv("WRITER_REASONING_EFFORT", "medium"),
+            verifier_reasoning_effort=os.getenv("VERIFIER_REASONING_EFFORT", "medium"),
+            orchestrator_reasoning_effort=os.getenv("ORCHESTRATOR_REASONING_EFFORT", "low"),
+            
+            # Per-agent max output tokens (Responses API max_output_tokens)
+            retriever_max_output_tokens=int(os.getenv("RETRIEVER_MAX_OUTPUT_TOKENS", "2000")),
+            writer_max_output_tokens=int(os.getenv("WRITER_MAX_OUTPUT_TOKENS", "16000")),
+            verifier_max_output_tokens=int(os.getenv("VERIFIER_MAX_OUTPUT_TOKENS", "16000")),
+            orchestrator_max_output_tokens=int(os.getenv("ORCHESTRATOR_MAX_OUTPUT_TOKENS", "2000")),
         )
         
         # Validate configurations and issue warnings
@@ -327,9 +349,18 @@ ORCHESTRATOR_MODEL=gpt-5.4-mini
 # Lower effort = faster, less accurate; Higher effort = slower, more accurate
 
 RETRIEVER_REASONING_EFFORT=low
-WRITER_REASONING_EFFORT=low
-VERIFIER_REASONING_EFFORT=low
+WRITER_REASONING_EFFORT=medium
+VERIFIER_REASONING_EFFORT=medium
 ORCHESTRATOR_REASONING_EFFORT=low
+
+# ----------------------------------------
+# Agent Max Output Tokens (optional)
+# ----------------------------------------
+# Cap each agent's model output length (Responses API max_output_tokens)
+RETRIEVER_MAX_OUTPUT_TOKENS=2000
+WRITER_MAX_OUTPUT_TOKENS=16000
+VERIFIER_MAX_OUTPUT_TOKENS=16000
+ORCHESTRATOR_MAX_OUTPUT_TOKENS=2000
 
 # ----------------------------------------
 # Local LLM Examples

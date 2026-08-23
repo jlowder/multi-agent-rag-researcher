@@ -187,9 +187,14 @@ def handle_save_report(state: dict) -> str:
     query = state.get("last_report_query", "")
     if not report.strip():
         return "No report to save. Run a query first."
-    from memory.save_report import save_report
+    from memory.save_report import save_report, ReportConfig
     session_id = state.get("session_id", "default")
-    path = save_report(report, query=query, session_id=session_id)
+    path = save_report(
+        report,
+        query=query,
+        session_id=session_id,
+        config=ReportConfig.research(),
+    )
     return f"Report saved to: {path}"
 
 

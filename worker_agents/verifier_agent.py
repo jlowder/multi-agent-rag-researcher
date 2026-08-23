@@ -1,6 +1,7 @@
 from .model_runner import run_model
 from typing import Any, Optional
 from memory import debug, info
+from utils.config import get_config
 
 
 def parse_evidence_status(text: str) -> Optional[dict]:
@@ -105,6 +106,21 @@ def parse_evidence_status(text: str) -> Optional[dict]:
         traceback.print_exc()
         return None
 
+
+def _strip_evidence_status_block(text: str) -> str:
+    """Remove a trailing EVIDENCE_STATUS block (and its ~~~ delimiters).
+
+    P0-3: the EVIDENCE_STATUS block is machine-side only and must never
+    reach user-facing text.
+    """
+    marker = text.find('EVIDENCE_STATUS:')
+    if marker == -1:
+        return text.rstrip()
+    opening = text.rfind('~~~', 0, marker)
+    cut = opening if opening != -1 else marker
+    return text[:cut].rstrip()
+
+
 """
 Verifier Agent
 ================================================
@@ -121,10 +137,13 @@ def verifier_agent(
     verbose: bool = False,
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
-) -> str:
+    has_doc_evidence: bool = False,
+    has_web_evidence: bool = False,
+    short_draft: bool = False,
+) -> tuple[str, dict]:
     """
     Execute the verifier agent.
-    
+
     Args:
         user_query: The user's original query
         written_draft: The draft report to verify
@@ -132,9 +151,17 @@ def verifier_agent(
         verbose: Whether to print debug information
         endpoint: Optional custom endpoint URL
         api_key: Optional custom API key
-        
+        has_doc_evidence: Whether the active evidence includes document chunks
+            (route signal computed by the orchestrator from state, P0-2)
+        has_web_evidence: Whether the active evidence includes web results
+            (route signal computed by the orchestrator from state, P0-2)
+        short_draft: Whether the draft is under 1500 characters (P0-8)
+
     Returns:
-        The verified report as a string
+        Tuple of (clean_text, status_dict): the verified report with the
+        EVIDENCE_STATUS block stripped, and the machine-side status dict
+        (confidence, coverage, gap_queries, specific_queries, re_retrieve,
+        route, short_draft). The status dict is never appended to the text.
     """
     if verbose:
         info("Verifier Agent: Verifying report...")
@@ -181,6 +208,15 @@ def verifier_agent(
         """
     )
 
+    # P0-8: note a short draft so the verifier judges depth accordingly.
+    if short_draft:
+        instructions += (
+            "\n\nDRAFT LENGTH NOTE: The draft is under 1500 characters. Judge depth "
+            "accordingly: a short answer may be appropriate for a narrow query, but "
+            "for a broad query scope treat the short length as a depth gap and "
+            "reflect it in the EVIDENCE_STATUS block."
+        )
+
     # Pass the query, report draft, and evidence together so the verifier can
     # check the claims and return the final verified report.
     input_text = (
@@ -189,107 +225,58 @@ def verifier_agent(
         f"Evidence:\n{evidence_text}"
     )
 
+    config = get_config()
     response = run_model(
         instructions=instructions,
         input_data=input_text,
-        reasoning_effort="low",
+        reasoning_effort=config.get_reasoning_effort("verifier"),
+        max_output_tokens=config.get_max_output_tokens("verifier"),
         tools=None,
         agent_name="verifier",
         endpoint=endpoint,
         api_key=api_key,
     )
-    output = response.output_text or ""
+    raw_output = response.output_text or ""
 
-    # Strip any existing EVIDENCE_STATUS block from the raw output
-    existing_block_start = output.find('EVIDENCE_STATUS:')
-    if existing_block_start >= 0:
-        output = output[:existing_block_start].strip()
+    # Parse the model's EVIDENCE_STATUS block (machine-side only, P0-2/P0-3)
+    parsed_status = parse_evidence_status(raw_output)
 
-    # Parse status from the existing block (if any)
-    parsed_status = parse_evidence_status(response.output_text or "")
-
-    # Synthesize defaults if parser failed
+    # Parse-failure default (P0-2): do NOT force re-retrieval; just log.
     if not parsed_status:
+        debug("verifier_agent: EVIDENCE_STATUS block missing or unparseable; defaulting re_retrieve=False")
         parsed_status = {
             'confidence': 'medium',
             'coverage': 'moderate',
-            'gaps': ['Coverage assessment failed due to parsing issue; recommend deeper analysis'],
-            're_retrieve': True,
-            'suggested_queries': ['Check if the retrieved evidence covers the full scope of the query'],
+            'gaps': [],
+            're_retrieve': False,
+            'suggested_queries': [],
         }
 
     confidence = parsed_status.get('confidence', 'medium')
     coverage = parsed_status.get('coverage', 'moderate')
-    gaps = parsed_status.get('gaps', [])
-    re_retrieve = str(parsed_status.get('re_retrieve', False)).lower()
-    queries = parsed_status.get('suggested_queries', [])
+    gap_queries = [g for g in parsed_status.get('gaps', []) if g]
+    specific_queries = [q for q in parsed_status.get('suggested_queries', []) if q]
+    re_retrieve = bool(parsed_status.get('re_retrieve', False))
 
-    # Conservative override: if coverage is thin/moderate but LLM didn't re-retrieve,
-    # the verifier may have been overconfident
-    if coverage in ('thin', 'moderate') and not re_retrieve:
+    # Force-override (P0-2): ONLY when coverage is thin AND the critic listed
+    # concrete gaps. No single-source / no-web / moderate-coverage forcing, and
+    # no boilerplate query injection (P0-4).
+    if not re_retrieve and coverage == "thin" and gap_queries:
+        debug(f"verifier_agent: forcing re_retrieve=True (coverage=thin, {len(gap_queries)} gaps)")
         re_retrieve = True
-        if not queries:
-            queries = ['Search for deeper coverage: attention variants, optimization techniques, and real-world applications']
 
-    # FORCE depth-awareness: the LLM is biased to say "comprehensive" on thin evidence.
-    # Parse evidence depth from evidence_text directly.
-    import re as _re
+    # Strip the EVIDENCE_STATUS block so it never reaches user-facing text (P0-3)
+    clean_text = _strip_evidence_status_block(raw_output)
 
-    # Count chunks by looking for unique chunk_id patterns
-    chunk_ids = set()
-    for match in _re.finditer(r'chunk_id[":\s]*(\S+)', evidence_text):
-        chunk_ids.add(match.group(1).strip('":\n'))
-    chunk_count = len(chunk_ids)
+    status_dict = {
+        'confidence': confidence,
+        'coverage': coverage,
+        'gap_queries': gap_queries,
+        'gaps': gap_queries,  # alias kept for existing readers (save_report, prompt context)
+        'specific_queries': specific_queries,
+        're_retrieve': re_retrieve,
+        'route': {'doc': bool(has_doc_evidence), 'web': bool(has_web_evidence)},
+        'short_draft': bool(short_draft),
+    }
 
-    # Count document sources
-    doc_matches = _re.findall(r'\[(\S+\.pdf)', evidence_text)
-    unique_sources = set(doc_matches)
-    has_web = 'web_search' in evidence_text or 'web_evidence' in evidence_text
-
-    is_single_source = len(unique_sources) <= 1
-    draft_length = len(written_draft) if written_draft else 0
-    is_thin_evidence = chunk_count < 15 or (chunk_count < 25 and draft_length < 2000)
-    is_no_web = not has_web
-
-    depth_assessment = []
-    if is_single_source:
-        depth_assessment.append("SINGLE-SOURCE: evidence from one document only")
-    if is_thin_evidence:
-        depth_assessment.append(f"THIN EVIDENCE: only {chunk_count} chunks retrieved (expected 15+ for comprehensive coverage)")
-    if is_no_web:
-        depth_assessment.append("NO_WEB_SEARCH: did not supplement with web search")
-
-    depth_override = ""
-    if depth_assessment:
-        depth_override = f"\n\n[DEPTH OVERRIDE: {'; '.join(depth_assessment)}. Consider whether coverage should be rated 'thin' or 'moderate' rather than 'comprehensive'.]"
-
-    # Conservative override: force re-retrieval when:
-    # 1. Coverage is thin/moderate, OR
-    # 2. The depth override detected problematic conditions (single source, thin evidence, no web)
-    if (coverage in ('thin', 'moderate') or depth_override) and not re_retrieve:
-        re_retrieve = True
-        suggested = []
-        if not queries:
-            suggested.append('Search for deeper coverage: attention variants (multi-query, grouped-query, flash), optimization techniques, and real-world applications')
-        if is_thin_evidence:
-            suggested.append('Use web_search to supplement document gaps')
-        if is_single_source:
-            suggested.append('Search for additional documents or perspectives on the topic')
-        queries = suggested if not queries else queries
-
-    # Always ensure the block is appended exactly once
-    block = f"""
-
-~~~
-EVIDENCE_STATUS:
-- confidence: {confidence}
-- coverage: {coverage}
-- gaps: {gaps}
-- re_retrieve: {re_retrieve}
-- suggested_queries: {queries}
-{depth_override}
-~~~
-"""
-    output = output.rstrip() + block
-
-    return output
+    return clean_text, status_dict

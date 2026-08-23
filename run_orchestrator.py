@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 from uuid import uuid4
 from pathlib import Path
+from typing import Dict, Any
 
 from memory import init_memory, set_debug_mode
-from memory.save_report import save_report
+from memory.save_report import save_report, ReportConfig, build_enriched_markdown
 from orchestrator_agent import orchestrator_agent
 from qdrant_vector_database import close_qdrant_client, ingest_documents
 
@@ -26,6 +27,10 @@ def chat_with_supervisor(session_id: str | None = None, debug: bool = False) -> 
 
     print("Analyze your pdfs!! \n")
     print("Use 'q', 'exit', or 'exist' to end chat. \n")
+    
+    # Research configuration: uncapped body/verification, capped snippets
+    report_config = ReportConfig.research()
+    
     while True:
         user_query = input("User: ").strip()
 
@@ -36,14 +41,41 @@ def chat_with_supervisor(session_id: str | None = None, debug: bool = False) -> 
             print("Exiting chat loop.")
             break
 
-        result = orchestrator_agent(user_query, session_id=session_id, verbose=True, debug_enabled=debug)
+        # Call orchestrator and get comprehensive state with evidence
+        result = orchestrator_agent(
+            user_query, 
+            session_id=session_id, 
+            verbose=True, 
+            debug_enabled=debug
+        )
+        
+        # Extract the final answer from the orchestration result
         answer = result.get("final_answer", "")
+        
         if answer:
             print(f"\nAssistant: {answer}\n")
 
+        # Build and save enriched markdown report with evidence from state
         if answer:
-            saved_path = save_report(answer, query=user_query, session_id=session_id)
+            # Pass the full orchestration state to save_report for enriched reporting
+            saved_path = save_report(
+                content=answer,
+                query=user_query,
+                session_id=session_id,
+                state=result,  # Pass orchestration state with evidence, verification, etc.
+                config=report_config  # Use research configuration (uncapped body)
+            )
             print(f"Report saved to: {saved_path}")
+            
+            # Optional: Log additional metadata for debugging
+            if debug:
+                evidence_json = result.get("evidence_json", "")
+                verification = result.get("verification", "")
+                status = result.get("verification_status", {})
+                print(f"[DEBUG] Evidence length: {len(evidence_json)} chars")
+                print(f"[DEBUG] Verification: {'present' if verification else 'missing'}")
+                print(f"[DEBUG] Status: {status}")
+        
         print()
 
 if __name__ == "__main__":
