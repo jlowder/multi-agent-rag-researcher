@@ -125,28 +125,42 @@ class Config:
     orchestrator_endpoint: Optional[str] = None
     orchestrator_api_key: Optional[str] = None
     orchestrator_model: Optional[str] = None
+
+    # Decomposer model override only (endpoint/api_key stay global): the
+    # structured research plan needs a schema-compliant model, which may
+    # differ from the global default (e.g. DECOMPOSER_MODEL=Qwen... while
+    # LLM_MODEL is a weaker local model).
+    decomposer_model: Optional[str] = None
     
     # Agent-specific defaults (reasoning effort, etc.)
     retriever_reasoning_effort: str = "low"
     writer_reasoning_effort: str = "medium"
     verifier_reasoning_effort: str = "medium"
     orchestrator_reasoning_effort: str = "low"
+    decomposer_reasoning_effort: str = "low"
+    sufficiency_reasoning_effort: str = "low"
     
     # Per-agent max output tokens (Responses API `max_output_tokens`)
     retriever_max_output_tokens: int = 2000
     writer_max_output_tokens: int = 16000
     verifier_max_output_tokens: int = 16000
     orchestrator_max_output_tokens: int = 2000
+    decomposer_max_output_tokens: int = 2000
+    sufficiency_max_output_tokens: int = 1000
     
     # Cached clients
     _clients: Dict[str, Any] = field(default_factory=dict)
     
     def get_agent_config(self, agent_name: str) -> LLMConfig:
         """Get configuration for a specific agent."""
-        # Get overrides for this agent
-        endpoint = getattr(self, f"{agent_name}_endpoint") or self.default_endpoint
-        api_key = getattr(self, f"{agent_name}_api_key") or self.default_api_key
-        model = getattr(self, f"{agent_name}_model") or self.default_model
+        # Get overrides for this agent. The override fields are optional:
+        # agents without dedicated fields (e.g. sufficiency, and the
+        # decomposer's endpoint/api_key) inherit the global defaults via
+        # the None fallback. The decomposer additionally supports a model
+        # override (DECOMPOSER_MODEL) for schema-compliance routing.
+        endpoint = getattr(self, f"{agent_name}_endpoint", None) or self.default_endpoint
+        api_key = getattr(self, f"{agent_name}_api_key", None) or self.default_api_key
+        model = getattr(self, f"{agent_name}_model", None) or self.default_model
         
         return LLMConfig(
             endpoint=endpoint,
@@ -199,17 +213,24 @@ def get_config() -> Config:
             orchestrator_api_key=os.getenv("ORCHESTRATOR_API_KEY"),
             orchestrator_model=os.getenv("ORCHESTRATOR_MODEL"),
             
+            # Decomposer model override (endpoint/api_key stay global)
+            decomposer_model=os.getenv("DECOMPOSER_MODEL"),
+            
             # Per-agent reasoning effort (documented in get_env_example)
             retriever_reasoning_effort=os.getenv("RETRIEVER_REASONING_EFFORT", "low"),
             writer_reasoning_effort=os.getenv("WRITER_REASONING_EFFORT", "medium"),
             verifier_reasoning_effort=os.getenv("VERIFIER_REASONING_EFFORT", "medium"),
             orchestrator_reasoning_effort=os.getenv("ORCHESTRATOR_REASONING_EFFORT", "low"),
+            decomposer_reasoning_effort=os.getenv("DECOMPOSER_REASONING_EFFORT", "low"),
+            sufficiency_reasoning_effort=os.getenv("SUFFICIENCY_REASONING_EFFORT", "low"),
             
             # Per-agent max output tokens (Responses API max_output_tokens)
             retriever_max_output_tokens=int(os.getenv("RETRIEVER_MAX_OUTPUT_TOKENS", "2000")),
             writer_max_output_tokens=int(os.getenv("WRITER_MAX_OUTPUT_TOKENS", "16000")),
             verifier_max_output_tokens=int(os.getenv("VERIFIER_MAX_OUTPUT_TOKENS", "16000")),
             orchestrator_max_output_tokens=int(os.getenv("ORCHESTRATOR_MAX_OUTPUT_TOKENS", "2000")),
+            decomposer_max_output_tokens=int(os.getenv("DECOMPOSER_MAX_OUTPUT_TOKENS", "2000")),
+            sufficiency_max_output_tokens=int(os.getenv("SUFFICIENCY_MAX_OUTPUT_TOKENS", "1000")),
         )
         
         # Validate configurations and issue warnings
@@ -231,7 +252,7 @@ def _validate_config(config: Config) -> None:
         print("⚠️  WARNING: Using OpenAI endpoint but no API key is set. LLM calls may fail.")
     
     # Print agent-specific configuration
-    agents = ["retriever", "writer", "verifier", "orchestrator"]
+    agents = ["retriever", "writer", "verifier", "orchestrator", "decomposer"]
     for agent in agents:
         agent_config = config.get_agent_config(agent)
         if agent_config.endpoint != config.default_endpoint:
@@ -352,6 +373,8 @@ RETRIEVER_REASONING_EFFORT=low
 WRITER_REASONING_EFFORT=medium
 VERIFIER_REASONING_EFFORT=medium
 ORCHESTRATOR_REASONING_EFFORT=low
+DECOMPOSER_REASONING_EFFORT=low
+SUFFICIENCY_REASONING_EFFORT=low
 
 # ----------------------------------------
 # Agent Max Output Tokens (optional)
@@ -361,6 +384,8 @@ RETRIEVER_MAX_OUTPUT_TOKENS=2000
 WRITER_MAX_OUTPUT_TOKENS=16000
 VERIFIER_MAX_OUTPUT_TOKENS=16000
 ORCHESTRATOR_MAX_OUTPUT_TOKENS=2000
+DECOMPOSER_MAX_OUTPUT_TOKENS=2000
+SUFFICIENCY_MAX_OUTPUT_TOKENS=1000
 
 # ----------------------------------------
 # Local LLM Examples
@@ -395,7 +420,7 @@ if __name__ == "__main__":
     print()
     
     # Test agent configs
-    agents = ["retriever", "writer", "verifier", "orchestrator"]
+    agents = ["retriever", "writer", "verifier", "orchestrator", "decomposer"]
     for agent in agents:
         agent_config = config.get_agent_config(agent)
         print(f"{agent.capitalize()} Agent:")

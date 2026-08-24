@@ -1,7 +1,12 @@
+import json
+import logging
 from .model_runner import run_model
-from typing import Any, Optional
+from typing import Any, List, Literal, Optional
+from pydantic import BaseModel, Field
 from memory import debug, info
 from utils.config import get_config
+
+logger = logging.getLogger(__name__)
 
 
 def parse_evidence_status(text: str) -> Optional[dict]:
@@ -280,3 +285,233 @@ def verifier_agent(
     }
 
     return clean_text, status_dict
+
+
+"""
+Structured critic (P1-4, DEEP.md §3.6 / plan B.4)
+=====================================================================================
+The deep pipeline's critic: evaluates the per-section draft against the
+citation-keyed evidence and returns a machine-readable VerificationReport.
+Unlike verifier_agent (which stays the legacy final-editor with the EVIDENCE
+STATUS contract), the critic NEVER rewrites or summarizes the report — the
+writer owns the final text. Only sections failing grounded/depth_ok go back
+to write_section with their gap list.
+"""
+
+
+class PerSectionReport(BaseModel):
+    """Critic verdict for one section."""
+
+    section_id: str
+    grounded: bool = Field(
+        default=True,
+        description="True only if every factual claim is supported by a cited [D#]/[W#] evidence item",
+    )
+    depth_ok: bool = Field(
+        default=True,
+        description="True if the section has >=300 words of substance with concrete specifics and no filler",
+    )
+    gaps: List[str] = Field(
+        default_factory=list,
+        description="Concrete, fixable problems (missing citation, thin claim, filler, no specifics)",
+    )
+    expand_queries: List[str] = Field(
+        default_factory=list,
+        description="At most 2 targeted retrieval queries that would close the gaps",
+    )
+
+
+class VerificationReport(BaseModel):
+    """Structured output of verification_critic."""
+
+    is_supported: bool = Field(
+        default=True,
+        description="True if the report as a whole is supported by the evidence",
+    )
+    hallucinated_claims: List[str] = Field(
+        default_factory=list,
+        description="Claims asserted as fact but contradicted or absent from the evidence",
+    )
+    unsupported_claims: List[str] = Field(
+        default_factory=list,
+        description="Claims with no supporting evidence item (citation missing or unresolvable)",
+    )
+    per_section: List[PerSectionReport] = Field(default_factory=list)
+    confidence_level: Literal["high", "medium", "low"] = "medium"
+    re_retrieve_suggested: bool = Field(
+        default=False,
+        description="True only if additional retrieval would materially improve the report",
+    )
+    specific_queries: List[str] = Field(
+        default_factory=list,
+        description="Targeted queries for the re-retrieval (empty when re_retrieve_suggested is false)",
+    )
+
+
+CRITIC_INSTRUCTIONS = """
+You are a CRITIC for a deep-research report. Do NOT rewrite, edit, or
+summarize the report — evaluate it against the evidence and return only the
+structured report.
+
+You receive:
+- the user query,
+- the report draft (one section per ## heading; each section is labeled with
+  its id in the input),
+- the citation-keyed evidence: every item carries a global key like [D1] or
+  [W2]. A claim is grounded only when it is supported by an item whose key
+  the section actually cites.
+
+Per section (ids provided in the input), judge:
+- grounded: is every factual claim supported by a [D#]/[W#]-keyed item that
+  the section cites? Any claim not supported by a cited item is a problem —
+  list it in gaps.
+- depth_ok: at least 300 words of substance, concrete specifics (named works,
+  numbers, dates), no filler ("it is important to note that…"), no heading
+  restatement, no hedging-only closer.
+- gaps: concrete, fixable problems (one short phrase each). Empty when the
+  section passes.
+- expand_queries: at most 2 targeted retrieval queries that would close the
+  gaps (empty when grounded and depth_ok).
+
+Overall:
+- is_supported: true only if the report as a whole stands on the evidence.
+- hallucinated_claims: claims asserted as fact that the evidence contradicts
+  or contains no trace of (quote the claim, keep it short).
+- unsupported_claims: claims with no supporting evidence (quote, keep short).
+- confidence_level: high (thorough, well-cited, no material gaps), medium
+  (solid with minor gaps), low (material gaps or ungrounded claims).
+- re_retrieve_suggested: true only if more evidence would materially improve
+  the report; specific_queries: the targeted queries (empty otherwise).
+
+Return only the structured report; no prose.
+"""
+
+
+def _neutral_critic_report(section_ids: List[str]) -> dict:
+    """Final fallback: a neutral pass for every section (P1-4 §7.2)."""
+    return {
+        "is_supported": True,
+        "hallucinated_claims": [],
+        "unsupported_claims": [],
+        "per_section": [
+            {
+                "section_id": sid,
+                "grounded": True,
+                "depth_ok": True,
+                "gaps": [],
+                "expand_queries": [],
+            }
+            for sid in section_ids
+        ],
+        "confidence_level": "medium",
+        "re_retrieve_suggested": False,
+        "specific_queries": [],
+        "source": "fallback",
+    }
+
+
+def verification_critic(
+    user_query: str,
+    report_text: str,
+    evidence_text: str,
+    section_ids: List[str],
+    verbose: bool = False,
+    endpoint: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> dict:
+    """
+    Run the structured critic over the per-section draft (P1-4).
+
+    ONE run_model call with text_format=VerificationReport (agent "verifier"
+    config). Parse chain: structured output -> JSON-in-text extraction ->
+    neutral pass (warning logged). ALWAYS returns a valid report dict shaped
+    like VerificationReport.model_dump() plus a "source" tag; never raises.
+
+    per_section is normalized to cover exactly the provided section_ids in
+    order (missing sections get a neutral pass; unknown ids are dropped; each
+    section keeps at most 2 expand_queries).
+    """
+    section_ids = [sid for sid in (section_ids or []) if sid and sid.strip()]
+    if verbose:
+        info(f"Critic: evaluating {len(section_ids)} section(s)...")
+
+    id_lines = "\n".join(f"- section id: {sid}" for sid in section_ids)
+    input_text = (
+        f"User query: {user_query}\n\n"
+        f"Report sections to evaluate (ids):\n{id_lines}\n\n"
+        f"Report draft:\n{report_text}\n\n"
+        f"Citation-keyed evidence (a claim is grounded only when supported by an item whose key the section cites):\n{evidence_text}"
+    )
+
+    report: Optional[VerificationReport] = None
+    response: Any = None
+    source = "structured"
+    try:
+        config = get_config()
+        response = run_model(
+            instructions=CRITIC_INSTRUCTIONS,
+            input_data=input_text,
+            text_format=VerificationReport,
+            reasoning_effort=config.get_reasoning_effort("verifier"),
+            max_output_tokens=config.get_max_output_tokens("verifier"),
+            tools=None,
+            agent_name="verifier",
+            endpoint=endpoint,
+            api_key=api_key,
+        )
+        parsed = getattr(response, "output_parsed", None)
+        if parsed is not None:
+            report = VerificationReport.model_validate(parsed)
+        else:
+            raise ValueError("no structured output on response")
+    except Exception as exc:
+        source = "json-fallback"
+        try:
+            raw_text = getattr(response, "output_text", None) or ""
+            start = raw_text.find("{")
+            end = raw_text.rfind("}")
+            if start != -1 and end > start:
+                report = VerificationReport.model_validate(
+                    json.loads(raw_text[start : end + 1])
+                )
+            else:
+                raise ValueError("no JSON object in text")
+        except Exception as exc2:
+            logger.warning(
+                f"verification_critic: report could not be parsed "
+                f"(structured: {exc}; text: {exc2}); using neutral pass"
+            )
+            return _neutral_critic_report(section_ids)
+
+    data = report.model_dump()
+
+    # Normalize per_section to exactly the provided ids, in order.
+    by_id = {}
+    for entry in data.get("per_section") or []:
+        if isinstance(entry, dict) and entry.get("section_id"):
+            by_id[str(entry["section_id"]).strip()] = entry
+    normalized: List[dict] = []
+    for sid in section_ids:
+        entry = by_id.get(sid)
+        if entry is None:
+            entry = {
+                "section_id": sid,
+                "grounded": True,
+                "depth_ok": True,
+                "gaps": [],
+                "expand_queries": [],
+            }
+        normalized.append(
+            {
+                "section_id": sid,
+                "grounded": bool(entry.get("grounded", True)),
+                "depth_ok": bool(entry.get("depth_ok", True)),
+                "gaps": [g for g in (entry.get("gaps") or []) if g and g.strip()],
+                "expand_queries": [q for q in (entry.get("expand_queries") or []) if q and q.strip()][
+                    :2
+                ],
+            }
+        )
+    data["per_section"] = normalized
+    data["source"] = source
+    return data

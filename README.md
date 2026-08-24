@@ -11,12 +11,13 @@ The three worker agents are:
 
 ## Key Components
 
-1. `gpt-5.4` model used by the orchestrator and all worker agents
+1. A configurable OpenAI-compatible LLM — project default `Ornith-1.0-35B-MLX-oQ8` via a local omlx server — used by all agents, with per-agent model, reasoning-effort, and output-token overrides
 2. Step-by-step function calling that allows the agents to interact with one another
 3. Qdrant vector database for local PDF retrieval
 4. Tavily for web search
 5. SQLite for short-term memory
 6. Gradio UI for browser-based interaction
+7. An optional 5-stage deep-research pipeline (`--mode deep`) for long-form, heavily cited reports
 
 ## Multi-Agent Architecture
 
@@ -91,6 +92,18 @@ The orchestrator coordinates the three worker agents: Retriever, Writer, and Ver
 
 Note: The orchestrator has a guardrail that keeps the system focused on research and factual questions. It refuses unrelated general tasks such as coding help or simple math because the goal of the system is to function as a research assistant.
 
+### Deep Research Mode (5-Stage Pipeline)
+
+Deep mode (`--mode deep`) is a separate pipeline in `deep_research_orchestrator.py` (repo root; entry point `deep_research(user_query)`, returning `{"final_answer", "state", "stats"}`). It reuses the retriever and writer and adds a decomposer:
+
+1. **Decompose** — `worker_agents/decomposition_agent.py` turns the query into a structured ResearchPlan of 5-10 sub-questions (each with `sub_question`, `angle`, `heading`, `expected_sources`, `priority`, and a code-generated `id`). Parsing has four fallback paths — structured output, structured retry, plain-text JSON, then a deterministic fallback — so a plan always succeeds.
+2. **Investigate** — one research pack per sub-question: retrieve, then an LLM sufficiency check; up to 3 rounds, up to 10 doc and 5 web chunks per round.
+3. **Per-section draft** — one writer call per section, given only that section's evidence plus a citation contract.
+4. **Critic** — a structured per-section verdict pass with budgeted revisions (max 2 per section, 8 total).
+5. **Assembly** — the executive summary is written last; inline citation keys are renumbered to `[1..N]` and the References section is rendered deterministically from the citation registry.
+
+A global budget caps a run at 40 LLM calls. If the budget runs out or an individual call fails, the pipeline logs a warning and assembles from what exists — it never crashes mid-report.
+
 ## Project Structure
 
 ```text
@@ -101,11 +114,13 @@ Note: The orchestrator has a guardrail that keeps the system focused on research
 ├── ui/                           # Gradio app and UI handlers
 ├── utils/
 │   ├── requirements.txt          # Python dependencies
-│   ├── var.env                   # Local API keys
+│   ├── var.env                   # Local API keys (gitignored; seeded from .env.example)
 │   ├── memory.db                 # Created at runtime
 │   └── qdrant_storage/           # Created at runtime
-├── worker_agents/                # Retriever, writer, and verifier
-├── orchestrator_agent.py         # Main coordinator
+├── worker_agents/                # Retriever, writer, verifier, and decomposer
+├── orchestrator_agent.py         # Main coordinator (standard mode)
+├── deep_research_orchestrator.py # 5-stage deep-research pipeline (deep mode)
+├── tests/                        # pytest suite
 └── run_orchestrator.py           # CLI entry point
 ```
 
@@ -129,8 +144,8 @@ cd multi-agent-rag-researcher
 2. Create and activate a virtual environment:
 
 ```bash
-python3 -m venv env
-source env/bin/activate
+python3 -m venv venv
+source venv/bin/activate
 ```
 
 3. Install the dependencies:
@@ -146,27 +161,46 @@ pip3 install langchain-openai
 # For OpenAI (default)
 LLM_ENDPOINT=https://api.openai.com/v1
 LLM_API_KEY=your_openai_api_key
+LLM_MODEL=gpt-5.4
 
 # For local LLMs (Ollama example)
 # LLM_ENDPOINT=http://localhost:11434/v1
+# LLM_MODEL=llama3.1:8b
 # LLM_API_KEY=n/a
+
+# Optional: deep-mode decomposer on a different (schema-compliant) model
+# DECOMPOSER_MODEL=Qwen3-Coder-Next-MLX-6bit
 
 TAVILY_API_KEY=your_tavily_api_key
 ```
 
+See the [Configuration](#configuration) section for the full list of supported variables.
+
 **Note:** See [LOCAL_LLM_SETUP.md](LOCAL_LLM_SETUP.md) for comprehensive configuration examples for Ollama, LocalAI, LM Studio, and other OpenAI-compatible services.
 
-5. Place the PDFs you want to index in the `docs/` folder, or upload PDFs later through the UI. The project already includes existing PDFs in `docs/`, currently `Gemma 3 Technical Report.pdf` and `DeepSeek-V3.2.pdf`, so you can use those directly or replace them with your own documents.
+5. Place the PDFs you want to index in the `docs/` folder, or upload PDFs later through the UI. The project ships with five genetic-programming papers in `docs/` (`01_koza_genetic_programming_1992.pdf` through `05_statistical_ml_elements_gp.pdf`), so you can index those directly or replace them with your own documents.
 
 ## Run Project
 
-### With OpenAI (Default)
+When the CLI starts, it ingests the PDFs in `docs/` into the local Qdrant store, then runs an interactive stdin loop: it prompts `User: ` for a query, and the session ends when you type `q` (the prompt also accepts `exit`/`exist`).
 
-No configuration needed. The system uses default OpenAI settings.
+### Standard mode (default)
 
 ```bash
 python3 run_orchestrator.py
 ```
+
+The original orchestrator loop: the orchestrator drives the retriever, writer, and verifier as LLM tools. A run takes about 10 LLM calls and a few minutes — best for quick questions over the indexed documents.
+
+### Deep mode
+
+```bash
+python3 run_orchestrator.py --mode deep
+```
+
+The 5-stage deep-research pipeline (decompose → investigate → per-section draft → critic → assembly, described above). A run typically takes 25-35 LLM calls and 15-30 minutes, under a global budget of 40 calls. If the budget runs out or a call fails, the pipeline logs a warning and assembles from what exists — it never crashes mid-report.
+
+Add `--debug` to either mode for verbose logging and saved-report metadata.
 
 ### With Local LLMs
 
@@ -183,7 +217,13 @@ python3 run_orchestrator.py
 
 See [LOCAL_LLM_SETUP.md](LOCAL_LLM_SETUP.md) for configuration examples for Ollama, LocalAI, LM Studio, and other OpenAI-compatible services.
 
-When the CLI starts, it ingests the PDFs in `docs/` into the local Qdrant store. Type `q` or `exit` to end the session.
+### Saved Reports
+
+Both modes save each answer to a timestamped `reports/<query-slug>_<timestamp>.md` file through the same flow: uncapped body and verification text, capped evidence snippets, and verification metadata (confidence level, coverage) in the report header.
+
+In deep mode the report is an executive summary, one section per sub-question, and a `## References` section numbered `[1..N]` by first appearance in the body. Every inline citation resolves to a reference entry: local documents show title, source file, and page; web results show title, URL, and date.
+
+An optional raw-evidence side-file (`<report-stem>.evidence.md`, written next to the report) is enabled by passing `include_evidence_dump=True` in `save_report`'s `ReportConfig`; it is off by default in both modes.
 
 ## Run UI for Multi-Agent Chat
 
@@ -194,6 +234,24 @@ python3 ui/gradio_app.py
 ```
 
 The UI automatically loads the default PDFs from `docs/` on startup. If you upload new PDFs, they replace the active indexed document set for that UI session.
+
+## Configuration
+
+The live env file is `utils/var.env` (gitignored). It is auto-seeded from `.env.example` on first run, so changes to `.env.example` only affect fresh setups — edit `utils/var.env` to change this project's configuration.
+
+- `LLM_MODEL` — default model for all agents. The project default is `Ornith-1.0-35B-MLX-oQ8` served by a local OpenAI-compatible omlx server (`LLM_ENDPOINT=http://localhost:8080/v1`), which serves several models concurrently.
+- `DECOMPOSER_MODEL` — per-agent model override for deep mode's decomposer only. Its structured schema is produced more reliably by the larger model (`Qwen3-Coder-Next-MLX-6bit` in the project config); every other agent stays on `LLM_MODEL`.
+- Per-agent `*_REASONING_EFFORT` (`low`/`medium`/`high`) and `*_MAX_OUTPUT_TOKENS` for all six agents (`retriever`, `writer`, `verifier`, `orchestrator`, `decomposer`, `sufficiency`). Defaults: writer and verifier run `medium` effort with 16,000 output tokens; retriever, orchestrator, and decomposer run `low` with 2,000; sufficiency runs `low` with 1,000.
+- The four original agents also accept full `*_ENDPOINT`/`*_API_KEY`/`*_MODEL` overrides (the decomposer accepts a model override only).
+- `TAVILY_API_KEY` powers web search; `EMBEDDING_ENDPOINT`/`EMBEDDING_MODEL`/`EMBEDDING_API_KEY` configure chunk embeddings.
+
+## Testing
+
+```bash
+venv/bin/python -m pytest tests/ -q
+```
+
+The pytest suite (84 tests) covers the save-report flow, citation context and key renumbering, decomposition (structured and fallback parsing), per-sub-question investigation, the deep pipeline end-to-end, and config overrides. Use the project virtualenv — system Python lacks the project dependencies.
 
 ## Notes
 

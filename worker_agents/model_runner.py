@@ -226,10 +226,22 @@ def run_model(
     
     if text_format is not None:
         logger.info("Calling client.responses.parse() with structured output")
-        return client.responses.parse(**request, text_format=text_format)
-    
-    logger.info("Calling client.responses.create()")
-    return client.responses.create(**request)
+        response = client.responses.parse(**request, text_format=text_format)
+    else:
+        logger.info("Calling client.responses.create()")
+        response = client.responses.create(**request)
+    # The local MLX server occasionally returns a response whose `output`
+    # is None (model glitch); reading .output_text on it raises TypeError.
+    # Normalize to an empty list so every caller's fallback path engages
+    # (decomposer fallback plan, neutral critic, empty prose) instead of
+    # crashing the whole run.
+    if getattr(response, "output", None) is None:
+        logger.warning(
+            f"Model returned a response with output=None "
+            f"(model={request.get('model')}); normalizing to empty output"
+        )
+        response.output = []
+    return response
 
 
 # Legacy function name for backward compatibility
