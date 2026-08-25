@@ -147,6 +147,12 @@ class Config:
     orchestrator_max_output_tokens: int = 2000
     decomposer_max_output_tokens: int = 2000
     sufficiency_max_output_tokens: int = 1000
+
+    # Deep-mode evidence cache (P2-2): reuse previously retrieved
+    # per-sub-question evidence within the TTL instead of re-retrieving.
+    # Disable with EVIDENCE_CACHE_ENABLED=false.
+    evidence_cache_enabled: bool = True
+    evidence_cache_ttl_days: int = 30
     
     # Cached clients
     _clients: Dict[str, Any] = field(default_factory=dict)
@@ -187,6 +193,17 @@ def get_config() -> Config:
     global _config
     
     if _config is None:
+        # Safe-int: a bad EVIDENCE_CACHE_TTL_DAYS must not crash config
+        # loading app-wide (falls back to the 30-day default).
+        try:
+            evidence_cache_ttl_days = int(os.getenv("EVIDENCE_CACHE_TTL_DAYS", "30"))
+        except (TypeError, ValueError):
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "Invalid EVIDENCE_CACHE_TTL_DAYS value; falling back to 30 days."
+            )
+            evidence_cache_ttl_days = 30
+
         _config = Config(
             # Global defaults from environment
             default_endpoint=os.getenv("LLM_ENDPOINT", os.getenv("OPENAI_ENDPOINT", "https://api.openai.com/v1")),
@@ -231,6 +248,10 @@ def get_config() -> Config:
             orchestrator_max_output_tokens=int(os.getenv("ORCHESTRATOR_MAX_OUTPUT_TOKENS", "2000")),
             decomposer_max_output_tokens=int(os.getenv("DECOMPOSER_MAX_OUTPUT_TOKENS", "2000")),
             sufficiency_max_output_tokens=int(os.getenv("SUFFICIENCY_MAX_OUTPUT_TOKENS", "1000")),
+            evidence_cache_enabled=os.getenv(
+                "EVIDENCE_CACHE_ENABLED", "true"
+            ).strip().lower() in ("1", "true", "yes", "on"),
+            evidence_cache_ttl_days=evidence_cache_ttl_days,
         )
         
         # Validate configurations and issue warnings
@@ -386,6 +407,14 @@ VERIFIER_MAX_OUTPUT_TOKENS=16000
 ORCHESTRATOR_MAX_OUTPUT_TOKENS=2000
 DECOMPOSER_MAX_OUTPUT_TOKENS=2000
 SUFFICIENCY_MAX_OUTPUT_TOKENS=1000
+
+# ----------------------------------------
+# Deep-Mode Evidence Cache (optional)
+# ----------------------------------------
+# Reuses previously retrieved per-sub-question evidence within the TTL
+# instead of re-retrieving; disabled by setting EVIDENCE_CACHE_ENABLED=false
+EVIDENCE_CACHE_ENABLED=true
+EVIDENCE_CACHE_TTL_DAYS=30
 
 # ----------------------------------------
 # Local LLM Examples

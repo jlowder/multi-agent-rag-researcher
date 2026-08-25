@@ -214,6 +214,7 @@ utils/var.env
 utils/qdrant_storage
 utils/indexed_documents.json
 utils/memory.db
+utils/evidence_cache.db
 
 package-lock.json
 .DS_Store

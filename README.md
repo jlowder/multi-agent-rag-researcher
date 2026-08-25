@@ -99,8 +99,12 @@ Deep mode (`--mode deep`) is a separate pipeline in `deep_research_orchestrator.
 1. **Decompose** — `worker_agents/decomposition_agent.py` turns the query into a structured ResearchPlan of 5-10 sub-questions (each with `sub_question`, `angle`, `heading`, `expected_sources`, `priority`, and a code-generated `id`). Parsing has four fallback paths — structured output, structured retry, plain-text JSON, then a deterministic fallback — so a plan always succeeds.
 2. **Investigate** — one research pack per sub-question: retrieve, then an LLM sufficiency check; up to 3 rounds, up to 10 doc and 5 web chunks per round.
 3. **Per-section draft** — one writer call per section, given only that section's evidence plus a citation contract.
-4. **Critic** — a structured per-section verdict pass with budgeted revisions (max 2 per section, 8 total).
+4. **Critic** — a structured per-section verdict pass (grounding, depth, and citation density ≥4 per 100 words) with budgeted revisions (max 2 per section, 8 total); under-cited sections are sent back for revision.
 5. **Assembly** — the executive summary is written last; inline citation keys are renumbered to `[1..N]` and the References section is rendered deterministically from the citation registry.
+
+With ≥3 sections, a final **Synthesis** section is drafted after the critic pass, connecting the content sections by name (skipped when <3 sections or the budget is tight).
+
+A per-sub-question evidence cache reuses recent retrievals across runs: stage 2 reuses a pack for a near-identical sub-question (≥0.8 token overlap) retrieved within `EVIDENCE_CACHE_TTL_DAYS` (default on, 30 days) — disabled with `EVIDENCE_CACHE_ENABLED=false`.
 
 A global budget caps a run at 40 LLM calls. If the budget runs out or an individual call fails, the pipeline logs a warning and assembles from what exists — it never crashes mid-report.
 
@@ -234,6 +238,8 @@ python3 ui/gradio_app.py
 ```
 
 The UI automatically loads the default PDFs from `docs/` on startup. If you upload new PDFs, they replace the active indexed document set for that UI session.
+
+The UI has a **Mode** selector (standard, default / deep). Deep mode runs the 5-stage pipeline and streams the report section-by-section as it is drafted, with a live stage/elapsed-time status line.
 
 ## Configuration
 

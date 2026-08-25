@@ -27,8 +27,10 @@ import importlib
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+from uuid import uuid4
 
+from memory.evidence_cache import lookup_evidence_detail, save_evidence
 from memory.helpers import (
     assign_citation_keys,
     format_references,
@@ -49,10 +51,16 @@ from worker_agents.decomposition_agent import decompose_query
 from worker_agents.model_runner import run_model
 from worker_agents.retriever_agent import retriever_agent
 from worker_agents.verifier_agent import verification_critic
-from worker_agents.writer_agent import write_section
+from worker_agents.writer_agent import write_section, write_synthesis
 from utils.config import get_config
 
 # Global LLM call budget for one deep-research run (plan B / P2-3 ≈ 40).
+# Worst-case tracked calls ≈ 45: decompose(1) + sufficiency/investigation
+# headroom + drafts(≤9) + critic(1) + revisions(≤8) + re-retrieval(≤2) +
+# synthesis(1) + exec summary(1). Degradation order on budget pressure:
+# the synthesis section is skipped BEFORE the executive summary is dropped
+# (the synthesis gate requires budget.can_afford(2), leaving room for the
+# exec summary).
 MAX_LLM_CALLS = 40
 
 # Revision caps (P1-4): per section and global expansion calls.
@@ -403,6 +411,30 @@ def _one_line_summary(section_text: str, max_words: int = 50) -> str:
     return words
 
 
+def _citation_density(body: str, sections: List[tuple]) -> Dict[str, Any]:
+    """Deterministic citation density for state (P2-4a).
+
+    overall: inline bracket citations per 100 words of the FINAL assembled
+    body (post-renumber, so every bracket is a [n] citation; exec summary
+    included, References excluded). per_section: the same ratio computed on
+    the final post-revision section texts, keyed by their FINAL headings
+    (renumbering never changes headings, so pre-/post-renumber are the same
+    sections)."""
+    bracket_re = re.compile(r"\[(?:\d+|[DW]\d+)(?:,\s*(?:\d+|[DW]\d+))*\]")
+    word_re = re.compile(r"\b\w+\b")
+
+    def ratio(text: str) -> float:
+        words = len(word_re.findall(text or ""))
+        if not words:
+            return 0.0
+        return round(len(bracket_re.findall(text)) / words * 100, 2)
+
+    return {
+        "overall": ratio(body),
+        "per_section": {heading: ratio(text) for _sid, heading, text in sections},
+    }
+
+
 def _derive_heading(question: str) -> str:
     """Fallback heading when the decomposer did not provide one: the
     question truncated to ≤60 chars, title-cased."""
@@ -444,6 +476,12 @@ Output only the summary prose: no heading, no preamble.
 """
 
 
+def _shorten(text: Any, limit: int = 80) -> str:
+    """Collapse whitespace and truncate for progress-callback detail lines."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
 def deep_research(
     user_query: str,
     verbose: bool = True,
@@ -452,6 +490,9 @@ def deep_research(
     budget_web: int = 5,
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
+    on_stage: Optional[Callable[[int, str], None]] = None,
+    on_section: Optional[Callable[[int, int, str, str, str], None]] = None,
+    session_id: Optional[str] = None,
 ) -> dict:
     """
     Run the 5-stage deep-research pipeline (plan Section B).
@@ -464,16 +505,31 @@ def deep_research(
         budget_web: Max web results kept per sub-question (default 5).
         endpoint: Optional custom endpoint URL for all agents.
         api_key: Optional custom API key for all agents.
+        on_stage: Optional progress callback on_stage(stage: int, detail: str),
+            called at each stage start (1-5) and once after stage 5
+            completes. Never kills the run, even if it raises.
+        on_section: Optional progress callback on_section(index, total,
+            heading, section_text, partial_report), called after each section
+            is successfully drafted in stage 3 (index is 1-based;
+            partial_report is the sections drafted so far, joined with blank
+            lines — the executive summary is written last and not included).
+        session_id: Optional cache session id for the P2-2 evidence cache
+            (None generates a fresh uuid4; lookups are cross-session either
+            way).
 
     Returns:
         {"final_answer": str, "state": dict, "stats": dict} where stats =
         {llm_calls, wall_s, sections, revisions, re_retrieves,
-        section_failures, exec_summary_failed}. state carries
+        section_failures, exec_summary_failed, cache_hits, cache_misses,
+        synthesis_words, synthesis_failed, synthesis_skipped}.
+        state carries
         the fields save_report consumes (verification, draft, evidence_json,
         verification_status) plus the investigation state (plan, per-sub-
         question packs, citation registry/maps, sections, critic report).
     """
     started = time.time()
+    if session_id is None:
+        session_id = str(uuid4())
     budget = _LLMBudget(MAX_LLM_CALLS)
     stats: Dict[str, Any] = {
         "llm_calls": 0,
@@ -483,6 +539,11 @@ def deep_research(
         "re_retrieves": 0,
         "section_failures": 0,
         "exec_summary_failed": False,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "synthesis_words": 0,
+        "synthesis_failed": False,
+        "synthesis_skipped": None,
     }
     state: Dict[str, Any] = {
         "plan": None,
@@ -510,6 +571,32 @@ def deep_research(
             f"llm_calls={budget.count}/{budget.limit} {extra}".rstrip()
         )
 
+    def _notify_stage(stage_no: int, detail: str) -> None:
+        # Progress callback: a bad callback must never kill the run.
+        if on_stage is None:
+            return
+        try:
+            on_stage(stage_no, detail)
+        except Exception as exc:
+            print(
+                f"[DEEP] WARNING: on_stage callback failed "
+                f"({type(exc).__name__}: {exc}); continuing."
+            )
+
+    def _notify_section(
+        index: int, total: int, heading: str, section_text: str,
+        partial_report: str,
+    ) -> None:
+        if on_section is None:
+            return
+        try:
+            on_section(index, total, heading, section_text, partial_report)
+        except Exception as exc:
+            print(
+                f"[DEEP] WARNING: on_section callback failed "
+                f"({type(exc).__name__}: {exc}); continuing."
+            )
+
     def _finish(final_answer: str) -> dict:
         stats["llm_calls"] = budget.count
         stats["wall_s"] = round(time.time() - started, 1)
@@ -532,6 +619,7 @@ def deep_research(
         # ------------------------------------------------------------------
         # STAGE 1 — DECOMPOSE
         # ------------------------------------------------------------------
+        _notify_stage(1, f"decomposing query: {_shorten(user_query)}")
         if not budget.can_afford(1):
             print("[DEEP] WARNING: LLM budget exhausted before decomposition; nothing to assemble.")
             return _finish(
@@ -580,6 +668,18 @@ def deep_research(
         # ------------------------------------------------------------------
         # STAGE 2 — INVESTIGATE (per sub-question, priority order)
         # ------------------------------------------------------------------
+        _notify_stage(2, f"investigating {len(sub_questions)} sub-question(s)")
+        # P2-2: optional per-sub-question evidence cache — reuse a recent,
+        # sufficient pack for a near-identical sub-question instead of
+        # re-retrieving. A cache failure must never break the run.
+        try:
+            _cache_cfg = get_config()
+            cache_enabled = bool(getattr(_cache_cfg, "evidence_cache_enabled", True))
+            cache_ttl_days = int(
+                getattr(_cache_cfg, "evidence_cache_ttl_days", 30)
+            )
+        except Exception:
+            cache_enabled, cache_ttl_days = False, 30
         for sub_question in sub_questions:
             sq_id = sub_question.get("id") or f"sq{len(packs) + 1}"
             routes = _routes_for(sub_question.get("expected_sources"), web_only)
@@ -589,22 +689,70 @@ def deep_research(
                     (sub_question.get("angle") or "").strip(),
                 ] if part
             )
+            _notify_stage(
+                2,
+                f"investigating sub-question {len(packs) + 1}/{len(sub_questions)}: "
+                f"{_shorten(goal)}",
+            )
             if verbose:
                 print(f"[DEEP] investigating {sq_id} (routes={routes}): {goal[:90]}")
-            pack = retriever_agent(
-                user_query,
-                research_goal=goal,
-                max_rounds=max_rounds,
-                budget_doc=budget_doc,
-                budget_web=budget_web,
-                routes=routes,
-                verbose=verbose,
-                endpoint=endpoint,
-                api_key=api_key,
-            )
-            packs[sq_id] = pack.model_dump()
+            sq_question = sub_question.get("question") or ""
+            pack_dict: Optional[dict] = None
+            if cache_enabled:
+                try:
+                    cached = lookup_evidence_detail(sq_question, cache_ttl_days)
+                except Exception as exc:
+                    print(
+                        f"[DEEP] WARNING: evidence cache lookup failed for {sq_id} "
+                        f"({type(exc).__name__}: {exc}); retrieving fresh."
+                    )
+                    cached = None
+                if cached is not None:
+                    pack_dict = cached["evidence"]
+                    stats["cache_hits"] += 1
+                    if verbose:
+                        print(
+                            f"[DEEP] {sq_id}: reused cached evidence "
+                            f"(age {cached['age_days']} days, "
+                            f"jaccard {cached['jaccard']:.2f})"
+                        )
+            if pack_dict is None:
+                pack = retriever_agent(
+                    user_query,
+                    research_goal=goal,
+                    max_rounds=max_rounds,
+                    budget_doc=budget_doc,
+                    budget_web=budget_web,
+                    routes=routes,
+                    verbose=verbose,
+                    endpoint=endpoint,
+                    api_key=api_key,
+                )
+                pack_dict = pack.model_dump()
+                if cache_enabled:
+                    stats["cache_misses"] += 1
+                    try:
+                        sufficiency = pack_dict.get("sufficiency") or {}
+                        save_evidence(
+                            session_id,
+                            sq_question,
+                            pack_dict,
+                            bool(sufficiency.get("is_sufficient")),
+                            ttl_days=cache_ttl_days,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[DEEP] WARNING: evidence cache save failed for {sq_id} "
+                            f"({type(exc).__name__}: {exc}); continuing without cache."
+                        )
+            packs[sq_id] = pack_dict
             state["sub_question_evidence"][sq_id] = packs[sq_id]
-        _log_stage("2 INVESTIGATE", f"packs={len(packs)}")
+        investigate_extra = f"packs={len(packs)}"
+        if stats["cache_hits"]:
+            investigate_extra += f" cache_hits={stats['cache_hits']}"
+        if stats["cache_misses"]:
+            investigate_extra += f" cache_misses={stats['cache_misses']}"
+        _log_stage("2 INVESTIGATE", investigate_extra)
 
         all_doc, all_web = _merge_evidence(list(packs.values()))
         registry, doc_key_map, web_key_map = assign_citation_keys(all_doc, all_web)
@@ -623,6 +771,7 @@ def deep_research(
         outline_text = "\n".join(
             f"{i}. {_heading_for(sq)}" for i, sq in enumerate(sub_questions, start=1)
         )
+        _notify_stage(3, f"drafting {len(sub_questions)} section(s)")
         for sub_question in sub_questions:
             if not budget.can_afford(1):
                 print(
@@ -674,6 +823,13 @@ def deep_research(
                 )
                 continue
             sections.append((sq_id, heading, section_text))
+            _notify_section(
+                len(sections),
+                len(sub_questions),
+                heading,
+                section_text,
+                "\n\n".join(text for _sid, _h, text in sections),
+            )
         draft_extra = f"sections={len(sections)}"
         if stats["section_failures"]:
             draft_extra += f" section_failures={stats['section_failures']}"
@@ -682,6 +838,7 @@ def deep_research(
         # ------------------------------------------------------------------
         # STAGE 4 — CRITIC (+ budgeted expansion / one re-retrieval)
         # ------------------------------------------------------------------
+        _notify_stage(4, "critic pass: checking every drafted section")
         if sections:
             draft_text = "\n\n".join(text for _sid, _h, text in sections)
             section_ids = [sq_id for sq_id, _h, _t in sections]
@@ -761,7 +918,11 @@ def deep_research(
                 for verdict in critic.get("per_section") or []:
                     if not isinstance(verdict, dict):
                         continue
-                    if verdict.get("grounded", True) and verdict.get("depth_ok", True):
+                    if (
+                        verdict.get("grounded", True)
+                        and verdict.get("depth_ok", True)
+                        and verdict.get("citation_density_ok", True)
+                    ):
                         continue
                     gaps = [g for g in (verdict.get("gaps") or []) if g and g.strip()]
                     if not gaps:
@@ -854,8 +1015,63 @@ def deep_research(
         _log_stage("4 CRITIC", critic_extra)
 
         # ------------------------------------------------------------------
+        # CROSS-SECTION SYNTHESIS (P2-4a) — drafted AFTER the critic (it only
+        # connects existing claims, so the critic does not review it) and
+        # before assembly. Appended as the LAST content section so it flows
+        # through renumbering, the exec-summary context, and assembly
+        # naturally. Document order: exec summary (top) → content sections
+        # → Synthesis → References.
+        # ------------------------------------------------------------------
+        if len(sections) < 3:
+            stats["synthesis_skipped"] = "too_few_sections"
+            print("[DEEP] synthesis skipped: fewer than 3 sections.")
+        elif not budget.can_afford(2):
+            # Degradation order: synthesis is skipped before the exec
+            # summary is dropped (can_afford(2) leaves room for it).
+            stats["synthesis_skipped"] = "budget"
+            print(
+                "[DEEP] synthesis skipped: LLM budget cannot cover synthesis "
+                "plus the executive summary."
+            )
+        else:
+            try:
+                budget.charge("synthesis", verbose=verbose)
+                synthesis_text = write_synthesis(
+                    user_query,
+                    [(heading, text) for _sid, heading, text in sections],
+                    verbose=verbose,
+                    endpoint=endpoint,
+                    api_key=api_key,
+                )
+                sections.append(("synthesis", "Synthesis", synthesis_text))
+                stats["synthesis_words"] = len(
+                    re.findall(r"\b\w+\b", synthesis_text)
+                )
+                if verbose:
+                    print(
+                        f"[DEEP] synthesis drafted: "
+                        f"{stats['synthesis_words']} words"
+                    )
+            except _BudgetExhausted:
+                stats["synthesis_skipped"] = "budget"
+                print(
+                    "[DEEP] WARNING: LLM budget exhausted before synthesis; "
+                    "continuing without it."
+                )
+            except Exception as exc:
+                # Transient LLM failure: assemble WITHOUT the synthesis
+                # section. Never crash (same contract as stage 3).
+                stats["synthesis_failed"] = True
+                print(
+                    f"[DEEP] WARNING: synthesis call failed "
+                    f"({type(exc).__name__}: {exc}); assembling without a "
+                    "synthesis section."
+                )
+
+        # ------------------------------------------------------------------
         # STAGE 5 — ASSEMBLY
         # ------------------------------------------------------------------
+        _notify_stage(5, "assembling final report")
         # (a) Executive summary, written LAST.
         exec_summary = ""
         if sections:
@@ -947,6 +1163,9 @@ def deep_research(
                 f"[DEEP] WARNING: dropped {len(dead_numbers)} unresolvable "
                 f"numeric citation(s): {shown}"
             )
+        # Deterministic citation density for state (overall on the final
+        # body, per_section on final headings; see _citation_density).
+        state["citation_density"] = _citation_density(body, sections)
         references = format_references(registry, cited_keys)
         final_parts = [body] if body else []
         if references:
@@ -1025,6 +1244,11 @@ def deep_research(
         if stats["exec_summary_failed"]:
             assembly_extra += " exec_summary_failed=1"
         _log_stage("5 ASSEMBLY", assembly_extra)
+        _notify_stage(
+            5,
+            f"complete: {len(sections)} section(s), "
+            f"{len(references.splitlines()) if references else 0} reference(s)",
+        )
 
         return _finish(final_answer)
     finally:

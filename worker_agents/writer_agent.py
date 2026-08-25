@@ -114,11 +114,15 @@ You are writing ONE section of a deep-research report. You will be given:
 CONTRACT — all of these are mandatory:
 1. Write at least 300 words of substance: concrete facts, mechanisms,
    comparisons, and examples grounded in the evidence — not filler.
-2. Cite every factual claim with a key that is ACTUALLY PROVIDED in the
+2. Cite every factual sentence with a key that is ACTUALLY PROVIDED in the
    evidence for this section (e.g. "[D1]", "[D1, W2]") at the end of the
-   sentence it supports. Cite at least once per 2-3 factual sentences.
-   NEVER invent or reuse a key that is not present in this section's
-   evidence.
+   sentence it supports: every factual sentence is one containing a claim,
+   name, number, date, or specific finding. Density target for this
+   section: at least 4 citations per 100 words; reusing the same key in
+   multiple sentences is correct and expected. NEVER invent a key that is
+   not present in this section's evidence. When a sentence cannot be cited
+   (pure synthesis or transition) — keep such sentences to a
+   minority of the section.
 3. Include at least 2 concrete specifics (named works, named researchers,
    numbers, dates) whenever the evidence supports them. Quantitative claims
    (numbers, dates, named results) must always carry a citation.
@@ -214,4 +218,90 @@ def write_section(
         text = f"## {section_heading}\n\n{text}"
     elif not text:
         text = f"## {section_heading}"
+    return text
+
+
+"""
+Cross-section synthesis (P2-4a)
+=====================================================================================
+Writes the final "## Synthesis" section that connects the finished content
+sections. Drafted AFTER the critic (it only connects existing claims, so the
+critic does not review it) and appended as the LAST content section before
+assembly. One-shot call, no tools — same style as write_section.
+"""
+
+SYNTHESIS_INSTRUCTIONS = """
+You are writing the FINAL SYNTHESIS section of a deep-research report. You
+will be given the overall user query (context only) and the finished content
+sections of the report, each with its heading.
+
+CONTRACT — all of these are mandatory:
+1. Output Markdown starting exactly with the line: ## Synthesis
+   (do not add a title above it).
+2. Write 300-500 words that connect the report's sections: explicitly
+   compare or contrast the findings of at least 3 different sections BY
+   NAME (use their headings).
+3. If the sections contain tensions or contradictions, identify them
+   explicitly; if they do not, say so honestly.
+4. State 2-3 field-level implications that follow from the combined
+   findings of the report.
+5. Citations: you may use ONLY [D#]/[W#] keys that appear in the provided
+   section texts, and only at the end of a sentence they support — never
+   invent a key. A pure-synthesis sentence may carry no citation.
+6. Do NOT introduce new factual claims not present in the provided
+   sections: you are connecting what is already there, not researching.
+"""
+
+
+def write_synthesis(
+    user_query: str,
+    sections: list[tuple[str, str]],
+    verbose: bool = False,
+    endpoint: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> str:
+    """
+    Write the final cross-section Synthesis section (P2-4a).
+
+    Args:
+        user_query: The overall user query (context only).
+        sections: (heading, section_text) pairs for every finished content
+            section, in report order.
+        verbose: Print a one-line progress note.
+        endpoint: Optional custom endpoint URL.
+        api_key: Optional custom API key.
+
+    Returns:
+        The synthesis markdown starting with "## Synthesis".
+    """
+    if verbose:
+        print("[WRITER] Writing synthesis section")
+
+    section_blocks = "\n\n".join(
+        f"### {heading}\n{text}" for heading, text in sections
+    )
+    input_text = (
+        f"Overall user query: {user_query}\n\n"
+        f"Finished content sections (connect these by name; cite ONLY keys "
+        f"already present in them):\n{section_blocks}"
+    )
+
+    config = get_config()
+    response = run_model(
+        instructions=SYNTHESIS_INSTRUCTIONS,
+        input_data=input_text,
+        reasoning_effort=config.get_reasoning_effort("writer"),
+        max_output_tokens=config.get_max_output_tokens("writer"),
+        tools=None,
+        agent_name="writer",
+        endpoint=endpoint,
+        api_key=api_key,
+    )
+    text = (response.output_text or "").strip()
+
+    # Defensive: the contract requires the section to start with its heading.
+    if text and not text.startswith("## "):
+        text = f"## Synthesis\n\n{text}"
+    elif not text:
+        text = "## Synthesis"
     return text

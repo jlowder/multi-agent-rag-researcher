@@ -99,6 +99,13 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
     with gr.Row():
         clear_button = gr.Button("Clear chat")
+        mode = gr.Radio(
+            ["standard", "deep"],
+            value="standard",
+            label="Mode",
+            info="standard: quick orchestrator loop · deep: 5-stage pipeline, "
+                 "sections stream in as they are drafted",
+        )
         debug_checkbox = gr.Checkbox(label="Debug mode", value=False)
 
     chatbot = gr.Chatbot(
@@ -129,7 +136,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         inputs=[uploads, chatbot, app_state],
         outputs=[chatbot, app_state, status],
     )
-    message.submit(chat, inputs=[message, chatbot, app_state, uploads, debug_checkbox], outputs=[message, chatbot, app_state, status])
+    message.submit(chat, inputs=[message, chatbot, app_state, uploads, debug_checkbox, mode], outputs=[message, chatbot, app_state, status])
 
 demo.queue(default_concurrency_limit=1)
 

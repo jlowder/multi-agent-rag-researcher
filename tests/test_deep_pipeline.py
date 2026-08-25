@@ -18,9 +18,12 @@ made. Covers the five required scenarios:
 """
 
 import json
+from pathlib import Path
 
 import importlib
 import re
+import shutil
+import tempfile
 import pytest
 
 import deep_research_orchestrator as dpo
@@ -33,6 +36,18 @@ rmod = importlib.import_module("worker_agents.retriever_agent")
 wmod = importlib.import_module("worker_agents.writer_agent")
 vmod = importlib.import_module("worker_agents.verifier_agent")
 ra = importlib.import_module("worker_agents.retriever_agent")
+
+# Temp directories holding per-test evidence-cache DBs (P2-2 isolation);
+# cleaned up by the autouse fixture below.
+_CACHE_TMP_DIRS: list = []
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_evidence_cache_tmp_dirs():
+    for d in _CACHE_TMP_DIRS:
+        shutil.rmtree(d, ignore_errors=True)
+    _CACHE_TMP_DIRS.clear()
+    yield
 
 
 class _FakeResponse:
@@ -124,6 +139,16 @@ def _install_stubs(monkeypatch, env: dict) -> dict:
     writer_text(index, kwargs) -> str, web_results(query) -> list,
     exec_text. Returns the writer call log."""
     monkeypatch.setattr(dpo, "_read_doc_catalog", lambda: [])
+    # P2-2: keep the deep-mode evidence cache off the real DB — fresh temp
+    # DB per test (lookups miss, saves land in a throwaway file).
+    ecache_mod = importlib.import_module("memory.evidence_cache")
+    cache_tmp_dir = tempfile.mkdtemp(prefix="evidence_cache_test_")
+    _CACHE_TMP_DIRS.append(cache_tmp_dir)
+    monkeypatch.setattr(
+        ecache_mod, "EVIDENCE_CACHE_DB_PATH",
+        Path(cache_tmp_dir) / "evidence_cache_test.db",
+    )
+    monkeypatch.setattr(ecache_mod, "_purged_this_process", False)
     monkeypatch.setattr(
         rmod, "retrieve_document",
         lambda *a, **k: {"query": a[0] if a else "", "chunks": []},
@@ -513,6 +538,13 @@ def test_critic_garbage_falls_back_to_neutral_no_revisions(monkeypatch):
     assert result["state"]["critic"]["source"] == "fallback"
     assert result["stats"]["revisions"] == 0
     assert len(writer_calls) == 2  # drafts only, no expansion
+    # Neutral pass: every per_section entry carries citation_density_ok=True
+    # (no spurious density revisions from the fallback).
+    assert result["state"]["critic"]["per_section"]
+    assert all(
+        entry["citation_density_ok"] is True
+        for entry in result["state"]["critic"]["per_section"]
+    )
     # Report still assembles with both sections + references.
     assert "## Section One" in result["final_answer"]
     assert "## Section Two" in result["final_answer"]
@@ -635,3 +667,259 @@ def test_deep_state_unwrap_helper():
     assert ro._deep_state({"final_answer": "a", "state": None}) == {}
     assert ro._deep_state({"final_answer": "a", "state": "not-a-dict"}) == {}
     assert ro._deep_state(None) == {}
+
+
+# ---------------------------------------------------------------------------
+# P2-4a — cross-section synthesizer + deterministic citation density
+# ---------------------------------------------------------------------------
+
+PLAN_JSON_3SQ = json.dumps(
+    {
+        "is_simple": False,
+        "sub_questions": [
+            {
+                "question": "Q1 what is the core algorithm?",
+                "angle": "operators and search",
+                "expected_sources": "both",
+                "priority": 1,
+                "heading": "Section One",
+            },
+            {
+                "question": "Q2 who were the pioneers?",
+                "angle": "history",
+                "expected_sources": "web",
+                "priority": 2,
+                "heading": "Section Two",
+            },
+            {
+                "question": "Q3 what tools exist?",
+                "angle": "ecosystem",
+                "expected_sources": "web",
+                "priority": 3,
+                "heading": "Section Three",
+            },
+        ],
+    }
+)
+
+
+def _synth_calls(writer_calls: list) -> list:
+    return [
+        c for c in writer_calls
+        if "SYNTHESIS" in (c.get("instructions") or "")
+    ]
+
+
+def test_synthesis_appended_last_and_keys_resolve(monkeypatch):
+    # T1: 3+ sections → write_synthesis called once; its heading is the
+    # LAST content H2 (before References); its [D2] resolves in References.
+    def writer_text(i, k):
+        if "SYNTHESIS" in (k.get("instructions") or ""):
+            return (
+                "## Synthesis\n\n"
+                "Section One and Section Two agree [D2], "
+                "while Section Three contrasts them [W1]."
+            )
+        return {
+            0: "## Section One\n\nBody [D1].",
+            1: "## Section Two\n\nBody [D1, W1].",
+            2: "## Section Three\n\nBody [W1].",
+        }[i]
+
+    env = _basic_env(writer_text=writer_text)
+    env["plan_json"] = PLAN_JSON_3SQ
+    writer_calls = _install_stubs(monkeypatch, env)
+    # Non-empty doc catalog (defeats the stub's web-only mode) plus doc
+    # evidence, so [D1]/[D2] are real registry keys (not invented).
+    monkeypatch.setattr(
+        dpo, "_read_doc_catalog",
+        lambda: [{"document_name": "a.pdf", "document_title": "a.pdf Title"}],
+    )
+    monkeypatch.setattr(
+        rmod, "retrieve_document",
+        lambda *a, **k: {
+            "query": a[0] if a else "",
+            "chunks": [_doc("c1", "a.pdf", 0.9), _doc("c2", "b.pdf", 0.8)],
+        },
+    )
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+
+    assert len(_synth_calls(writer_calls)) == 1
+    assert result["stats"]["synthesis_words"] > 0
+    assert result["stats"]["synthesis_failed"] is False
+    assert result["stats"]["synthesis_skipped"] is None
+
+    # Heading order: content sections, then Synthesis, then References.
+    h2s = re.findall(r"^## (.+)$", result["final_answer"], re.M)
+    assert h2s[-1] == "References"
+    assert h2s[-2] == "Synthesis"
+    assert h2s[:3] == ["Section One", "Section Two", "Section Three"]
+
+    # The synthesis's [D2] was renumbered (not dropped as invented) and its
+    # reference entry (b.pdf) is rendered; every inline [n] resolves.
+    body, refs = result["final_answer"].split("## References", 1)
+    assert "[D2]" not in body and "[D1]" not in body
+    assert "b.pdf" in refs
+    nums = {
+        int(n) for grp in re.findall(r"\[([\d,\s]+)\]", body)
+        for n in grp.split(",") if n.strip().isdigit()
+    }
+    assert nums
+    for n in nums:
+        assert re.search(rf"^\[{n}\] ", refs, re.M), f"[{n}] has no reference"
+
+
+def test_synthesis_skipped_on_budget_exec_summary_still_writes(monkeypatch):
+    # T2: 8 tracked calls before stage 5 (decompose + 3 sufficiency +
+    # 3 drafts + critic); limit 9 leaves exactly 1 call → synthesis (needs
+    # 2: itself + exec summary) is skipped, exec summary still writes.
+    def writer_text(i, k):
+        return f"## Section {i + 1} body [W1]."
+
+    env = _basic_env(writer_text=writer_text)
+    env["plan_json"] = PLAN_JSON_3SQ
+    writer_calls = _install_stubs(monkeypatch, env)
+    monkeypatch.setattr(dpo, "MAX_LLM_CALLS", 9)
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+
+    assert not _synth_calls(writer_calls)
+    assert result["stats"]["synthesis_skipped"] == "budget"
+    assert "## Synthesis" not in result["final_answer"]
+    # Exec summary wrote with the final remaining call.
+    assert "Synthesized executive summary prose." in result["final_answer"]
+    assert result["stats"]["llm_calls"] == 9
+
+
+def test_synthesis_failure_leaves_report_intact(monkeypatch):
+    # T3: write_synthesis raises → synthesis_failed=True, report assembles
+    # WITHOUT a Synthesis section, no crash.
+    def writer_text(i, k):
+        if "SYNTHESIS" in (k.get("instructions") or ""):
+            raise RuntimeError("boom: transient synthesis failure")
+        return {
+            0: "## Section One body [W1].",
+            1: "## Section Two body [W1].",
+            2: "## Section Three body [W1].",
+        }[i]
+
+    env = _basic_env(writer_text=writer_text)
+    env["plan_json"] = PLAN_JSON_3SQ
+    _install_stubs(monkeypatch, env)
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+
+    assert result["stats"]["synthesis_failed"] is True
+    assert "## Synthesis" not in result["final_answer"]
+    for h in ("Section One", "Section Two", "Section Three"):
+        assert f"## {h}" in result["final_answer"]
+    assert "## References" in result["final_answer"]
+
+
+def test_synthesis_skipped_when_too_few_sections(monkeypatch):
+    # T4: default plan = 2 sub-questions → synthesis never called.
+    writer_calls = _install_stubs(monkeypatch, _basic_env())
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+
+    assert not _synth_calls(writer_calls)
+    assert result["stats"]["synthesis_skipped"] == "too_few_sections"
+    assert "## Synthesis" not in result["final_answer"]
+    assert result["stats"]["llm_calls"] == 7  # nothing charged for synthesis
+
+
+def test_citation_density_state_is_deterministic(monkeypatch):
+    # T5: state["citation_density"] = {overall, per_section}; overall
+    # matches an independent recomputation on the final body.
+    result = _run(monkeypatch, _basic_env())
+    cd = result["state"]["citation_density"]
+    assert set(cd) == {"overall", "per_section"}
+    assert cd["per_section"].keys() == {"Section One", "Section Two"}
+
+    body = result["final_answer"].split("## References", 1)[0]
+    brackets = re.findall(r"\[\d+(?:,\s*\d+)*\]", body)
+    words = re.findall(r"\b\w+\b", body)
+    expected = round(len(brackets) / len(words) * 100, 2)
+    assert abs(cd["overall"] - expected) < 0.01
+    assert cd["overall"] > 0  # the stubbed sections do carry citations
+
+
+def test_evidence_cache_ttl_bad_value_falls_back(monkeypatch):
+    # T6: a non-int EVIDENCE_CACHE_TTL_DAYS must not crash get_config.
+    import utils.config as config_mod
+
+    config_mod.reset_config()
+    try:
+        monkeypatch.setenv("EVIDENCE_CACHE_TTL_DAYS", "abc")
+        cfg = config_mod.get_config()
+        assert cfg.evidence_cache_ttl_days == 30
+    finally:
+        config_mod.reset_config()
+
+
+# ---------------------------------------------------------------------------
+# P2-3 — citation-density tightening (writer contract + critic field/trigger)
+# ---------------------------------------------------------------------------
+
+def test_write_section_prompt_has_quantitative_citation_contract():
+    wmod = importlib.import_module("worker_agents.writer_agent")
+    prompt = wmod.WRITE_SECTION_INSTRUCTIONS.replace(
+        "{SECTION_HEADING}", "Test Heading"
+    )
+    assert "4 citations per 100 words" in prompt
+    assert "every factual sentence" in prompt
+    # Reusing a provided key is expected; inventing keys stays banned.
+    assert "reusing the same key" in prompt
+    assert "NEVER invent a key" in prompt
+    # Uncitable (synthesis/transition) sentences stay a minority.
+    assert "minority of the section" in prompt
+
+
+def test_critic_prompt_has_density_rule():
+    vmod_critic = importlib.import_module("worker_agents.verifier_agent")
+    assert "4 per 100 words" in vmod_critic.CRITIC_INSTRUCTIONS
+    assert "citation_density_ok" in vmod_critic.CRITIC_INSTRUCTIONS
+    assert "under-cited: add [D#]/[W#] citations" in vmod_critic.CRITIC_INSTRUCTIONS
+
+
+def test_neutral_critic_report_passes_density():
+    vmod_critic = importlib.import_module("worker_agents.verifier_agent")
+    report = vmod_critic._neutral_critic_report(["sq1", "sq2"])
+    assert [e["section_id"] for e in report["per_section"]] == ["sq1", "sq2"]
+    assert all(e["citation_density_ok"] is True for e in report["per_section"])
+
+
+def test_critic_low_citation_density_triggers_revision(monkeypatch):
+    under_cited_gap = (
+        "under-cited: add [D#]/[W#] citations to the uncited factual sentences"
+    )
+    critic = json.dumps(
+        {
+            "is_supported": True,
+            "overall_summary": "one under-cited section",
+            "hallucinated_claims": [],
+            "unsupported_claims": [],
+            "per_section": [
+                # grounded + depth_ok, but under-cited with a concrete gap:
+                # revision-eligible via the citation_density_ok branch.
+                {"section_id": "sq1", "grounded": True, "depth_ok": True,
+                 "citation_density_ok": False, "gaps": [under_cited_gap]},
+                {"section_id": "sq2", "grounded": True, "depth_ok": True,
+                 "citation_density_ok": True, "gaps": []},
+            ],
+            "re_retrieve_suggested": False,
+            "specific_queries": [],
+        }
+    )
+    writer_calls = _install_stubs(
+        monkeypatch, _basic_env(critic_text=critic)
+    )
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+
+    # 2 drafts + exactly 1 revision (only sq1 was flagged for density).
+    assert len(writer_calls) == 3
+    assert result["stats"]["revisions"] == 1
+    revision_input = writer_calls[2].get("input_data") or ""
+    assert "REVISION REQUIRED" in revision_input
+    assert under_cited_gap in revision_input
+    # The density flag normalized through the report intact.
+    by_id = {e["section_id"]: e for e in result["state"]["critic"]["per_section"]}
+    assert by_id["sq1"]["citation_density_ok"] is False
+    assert by_id["sq2"]["citation_density_ok"] is True

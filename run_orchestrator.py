@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 from uuid import uuid4
 from pathlib import Path
 from typing import Dict, Any
@@ -82,6 +83,14 @@ def chat_with_supervisor(
         # result is an envelope whose nested "state" is what save_report
         # consumes (evidence_json, verification, verification_status).
         save_state = _deep_state(result) if mode == "deep" else result
+        # Deep parity with the UI save: the verification summary renders in
+        # the evidence side file, so deep saves enable the dump (standard
+        # keeps it off — P0 parity).
+        save_config = report_config
+        if mode == "deep":
+            save_config = dataclasses.replace(
+                report_config, include_evidence_dump=True
+            )
 
         # Build and save enriched markdown report with evidence from state
         if answer:
@@ -91,7 +100,7 @@ def chat_with_supervisor(
                 query=user_query,
                 session_id=session_id,
                 state=save_state,  # state with evidence, verification, etc.
-                config=report_config  # Use research configuration (uncapped body)
+                config=save_config  # research config; deep adds the evidence dump
             )
             print(f"Report saved to: {saved_path}")
             

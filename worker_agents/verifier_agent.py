@@ -294,8 +294,8 @@ The deep pipeline's critic: evaluates the per-section draft against the
 citation-keyed evidence and returns a machine-readable VerificationReport.
 Unlike verifier_agent (which stays the legacy final-editor with the EVIDENCE
 STATUS contract), the critic NEVER rewrites or summarizes the report — the
-writer owns the final text. Only sections failing grounded/depth_ok go back
-to write_section with their gap list.
+writer owns the final text. Only sections failing grounded/depth_ok/
+citation_density_ok go back to write_section with their gap list.
 """
 
 
@@ -310,6 +310,10 @@ class PerSectionReport(BaseModel):
     depth_ok: bool = Field(
         default=True,
         description="True if the section has >=300 words of substance with concrete specifics and no filler",
+    )
+    citation_density_ok: bool = Field(
+        default=True,
+        description="True if the section carries at least 4 inline citation brackets per 100 words",
     )
     gaps: List[str] = Field(
         default_factory=list,
@@ -368,6 +372,12 @@ Per section (ids provided in the input), judge:
 - depth_ok: at least 300 words of substance, concrete specifics (named works,
   numbers, dates), no filler ("it is important to note that…"), no heading
   restatement, no hedging-only closer.
+- citation_density_ok: count the inline citation brackets in the section
+  text ([D#], [W#], or combined like [D1, W2]). The density threshold
+  is 4 per 100 words of that section: if the count is below it, set
+  citation_density_ok to false AND add a concrete gap entry such as
+  "under-cited: add [D#]/[W#] citations to the uncited factual
+  sentences".
 - gaps: concrete, fixable problems (one short phrase each). Empty when the
   section passes.
 - expand_queries: at most 2 targeted retrieval queries that would close the
@@ -398,6 +408,7 @@ def _neutral_critic_report(section_ids: List[str]) -> dict:
                 "section_id": sid,
                 "grounded": True,
                 "depth_ok": True,
+                "citation_density_ok": True,
                 "gaps": [],
                 "expand_queries": [],
             }
@@ -498,6 +509,7 @@ def verification_critic(
                 "section_id": sid,
                 "grounded": True,
                 "depth_ok": True,
+                "citation_density_ok": True,
                 "gaps": [],
                 "expand_queries": [],
             }
@@ -506,6 +518,7 @@ def verification_critic(
                 "section_id": sid,
                 "grounded": bool(entry.get("grounded", True)),
                 "depth_ok": bool(entry.get("depth_ok", True)),
+                "citation_density_ok": bool(entry.get("citation_density_ok", True)),
                 "gaps": [g for g in (entry.get("gaps") or []) if g and g.strip()],
                 "expand_queries": [q for q in (entry.get("expand_queries") or []) if q and q.strip()][
                     :2
