@@ -15,6 +15,7 @@ from ui.gradio_handlers import (
     INITIAL_STATUS,
     chat,
     clear_chat,
+    handle_save_report,
     ingest_uploaded_documents,
     load_default_docs,
 )
@@ -98,6 +99,14 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
     with gr.Row():
         clear_button = gr.Button("Clear chat")
+        mode = gr.Radio(
+            ["standard", "deep"],
+            value="standard",
+            label="Mode",
+            info="standard: quick orchestrator loop · deep: 5-stage pipeline, "
+                 "sections stream in as they are drafted",
+        )
+        debug_checkbox = gr.Checkbox(label="Debug mode", value=False)
 
     chatbot = gr.Chatbot(
         show_label=False,
@@ -110,6 +119,16 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         container=False,
     )
 
+    # Save report section
+    with gr.Accordion("Save Report", open=False):
+        save_btn = gr.Button("💾 Save Report as Markdown")
+        save_status = gr.Textbox(label="Save Status", interactive=False, lines=2)
+    save_btn.click(
+        fn=handle_save_report,
+        inputs=[app_state],
+        outputs=save_status,
+    )
+
     demo.load(load_default_docs, inputs=app_state, outputs=[app_state, status])
     clear_button.click(clear_chat, inputs=app_state, outputs=[chatbot, app_state, status])
     uploads.change(
@@ -117,7 +136,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         inputs=[uploads, chatbot, app_state],
         outputs=[chatbot, app_state, status],
     )
-    message.submit(chat, inputs=[message, chatbot, app_state, uploads], outputs=[message, chatbot, app_state, status])
+    message.submit(chat, inputs=[message, chatbot, app_state, uploads, debug_checkbox, mode], outputs=[message, chatbot, app_state, status])
 
 demo.queue(default_concurrency_limit=1)
 

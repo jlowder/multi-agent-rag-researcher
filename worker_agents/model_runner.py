@@ -100,6 +100,7 @@ def run_model(
     previous_response_id: Optional[str] = None,
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
     text_format: Any = None,
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -115,6 +116,8 @@ def run_model(
         previous_response_id: ID of previous response for multi-turn conversations
         model: Model name (uses agent-specific or default if not provided)
         reasoning_effort: Reasoning effort level (e.g., "low", "medium", "high")
+        max_output_tokens: Optional cap on model output length (Responses API
+            max_output_tokens); omitted from the request when None
         text_format: Optional Pydantic model for structured output
         endpoint: Custom endpoint URL (overrides default)
         api_key: Custom API key (overrides default)
@@ -138,6 +141,7 @@ def run_model(
     logger.info(f"  previous_response_id: {previous_response_id}")
     logger.info(f"  model (incoming): {model} (type: {type(model).__name__ if model is not None else 'NoneType'})")
     logger.info(f"  reasoning_effort: {reasoning_effort}")
+    logger.info(f"  max_output_tokens: {max_output_tokens}")
     logger.info(f"  text_format: {text_format}")
     logger.info(f"  endpoint: {endpoint}")
     logger.info(f"  api_key: {'***' if api_key else '(none)'}")
@@ -190,7 +194,9 @@ def run_model(
         instructions=instructions,
         input=input_data,
         tools=tools or [],
-        tool_choice="auto",
+        # Force tool usage if tools are provided (prevents LLM from answering
+        # from training data instead of using retrieval tools)
+        tool_choice = "required" if tools else "auto",
         previous_response_id=previous_response_id,
         parallel_tool_calls=False,
     )
@@ -198,6 +204,10 @@ def run_model(
     if reasoning_effort:
         request["reasoning"] = {"effort": reasoning_effort}
         logger.info(f"Added reasoning_effort: {reasoning_effort}")
+    
+    if max_output_tokens is not None:
+        request["max_output_tokens"] = max_output_tokens
+        logger.info(f"Added max_output_tokens: {max_output_tokens}")
     
     logger.info("=" * 80)
     logger.info("FINAL REQUEST DICT (about to send to API):")
@@ -210,14 +220,28 @@ def run_model(
     logger.info(f"  parallel_tool_calls: {request['parallel_tool_calls']}")
     if "reasoning" in request:
         logger.info(f"  reasoning: {request['reasoning']}")
+    if "max_output_tokens" in request:
+        logger.info(f"  max_output_tokens: {request['max_output_tokens']}")
     logger.info("=" * 80)
     
     if text_format is not None:
         logger.info("Calling client.responses.parse() with structured output")
-        return client.responses.parse(**request, text_format=text_format)
-    
-    logger.info("Calling client.responses.create()")
-    return client.responses.create(**request)
+        response = client.responses.parse(**request, text_format=text_format)
+    else:
+        logger.info("Calling client.responses.create()")
+        response = client.responses.create(**request)
+    # The local MLX server occasionally returns a response whose `output`
+    # is None (model glitch); reading .output_text on it raises TypeError.
+    # Normalize to an empty list so every caller's fallback path engages
+    # (decomposer fallback plan, neutral critic, empty prose) instead of
+    # crashing the whole run.
+    if getattr(response, "output", None) is None:
+        logger.warning(
+            f"Model returned a response with output=None "
+            f"(model={request.get('model')}); normalizing to empty output"
+        )
+        response.output = []
+    return response
 
 
 # Legacy function name for backward compatibility

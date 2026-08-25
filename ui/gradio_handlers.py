@@ -1,25 +1,36 @@
 from __future__ import annotations
 
 import sys
+import traceback
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from queue import Empty, Queue
 from shutil import copy2, rmtree
 from tempfile import mkdtemp
-from threading import Thread
-from time import sleep
+from threading import Lock, Thread
+from time import monotonic, sleep
 from uuid import uuid4
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from memory import init_memory
+from deep_research_orchestrator import deep_research
+from memory import init_memory, set_debug_mode
 from orchestrator_agent import orchestrator_agent
 from qdrant_vector_database import ingest_documents
 
 DEFAULT_DOCS_DIR = ROOT_DIR / "docs"
+
+# One deep run at a time: a second submission while a run is in flight
+# (e.g. after a UI stop orphaned its worker) must not start a concurrent
+# run_model burst that races the LLM call budget.
+_deep_run_lock = Lock()
+
+# Watchdog: a deep run outliving this is treated as hung — the UI yields a
+# timeout frame and returns (the worker keeps running and frees the lock).
+MAX_DEEP_RUN_SECONDS = 45 * 60
 
 
 def build_app_state(
@@ -61,6 +72,13 @@ def status_text(state: dict) -> str:
     if state.get("ready"):
         return f"Research source: `{state.get('source') or 'docs/'}`"
     return "Research source: `docs/` until you upload your own PDFs to replace the current indexed documents"
+
+
+def _elapsed_seconds(start: float) -> str:
+    total = int(monotonic() - start)
+    if total < 60:
+        return f"{total}s"
+    return f"{total // 60}m {total % 60}s"
 
 
 def capture_logs(func, *args, **kwargs):
@@ -152,6 +170,10 @@ def clear_chat(state: dict) -> tuple[list, dict, str]:
         source=state.get("source", ""),
         source_key=state.get("source_key", "docs"),
     )
+    # Preserve report fields on clear
+    next_state["last_report"] = state.get("last_report", "")
+    next_state["last_report_query"] = state.get("last_report_query", "")
+    next_state["last_report_state"] = state.get("last_report_state")
     return [], next_state, status_text(next_state)
 
 
@@ -178,11 +200,135 @@ def ingest_uploaded_documents(
         yield history, state, status_text(state)
 
 
-def chat(message: str, history: list[dict] | None, state: dict, file_paths: list[str] | None):
+def handle_save_report(state: dict) -> str:
+    """Save the latest research report to a markdown file and return the path."""
+    report = state.get("last_report", "") or ""
+    query = state.get("last_report_query", "")
+    if not report.strip():
+        return "No report to save. Run a query first."
+    from memory.save_report import save_report, ReportConfig
+    session_id = state.get("session_id", "default")
+    report_state = state.get("last_report_state")
+    if isinstance(report_state, dict) and report_state:
+        # Deep mode: the NESTED pipeline state (top-level evidence_json,
+        # verification, verification_status) enriches the saved report with
+        # the verification header and the raw-evidence side file.
+        config = ReportConfig.research()
+        config.include_evidence_dump = True
+        path = save_report(
+            report,
+            query=query,
+            session_id=session_id,
+            state=report_state,
+            config=config,
+        )
+        return f"Report saved to: {path}"
+    path = save_report(
+        report,
+        query=query,
+        session_id=session_id,
+        config=ReportConfig.research(),
+    )
+    return f"Report saved to: {path}"
+
+
+def _chat_deep(message: str, history: list[dict], state: dict):
+    """Deep-mode generator (P2-5): a worker thread runs deep_research while
+    its on_stage/on_section callbacks push events onto a queue; the generator
+    yields a status line plus the growing partial report on a ~0.5s heartbeat
+    and, on completion, hands the NESTED pipeline state (not the
+    {"final_answer","state","stats"} envelope) to the save flow via
+    state["last_report_state"]."""
+    started = monotonic()
+    event_queue: Queue = Queue()
+    result_box: dict[str, object] = {"result": None, "error": None}
+
+    def on_stage(stage_no: int, detail: str) -> None:
+        event_queue.put(("stage", stage_no, detail))
+
+    def on_section(index: int, total: int, heading: str,
+                   section_text: str, partial_report: str) -> None:
+        event_queue.put(("section", partial_report))
+
+    def run_deep() -> None:
+        if not _deep_run_lock.acquire(blocking=False):
+            # An orphaned prior run is still executing: never start a second
+            # concurrent deep run — fail fast with a one-line error instead.
+            result_box["error"] = RuntimeError(
+                "A deep research run is already in progress — please wait "
+                "for it to finish."
+            )
+            event_queue.put(("done", None))
+            return
+        try:
+            result_box["result"] = deep_research(
+                message,
+                verbose=True,
+                on_stage=on_stage,
+                on_section=on_section,
+            )
+        except Exception as exc:
+            traceback.print_exc()  # full detail to the server log; the UI
+            # gets a one-line error (raised via the "done" event below)
+            result_box["error"] = exc
+        finally:
+            _deep_run_lock.release()
+            event_queue.put(("done", None))
+
+    Thread(target=run_deep, daemon=True).start()
+
+    stage_label = "starting deep research"
+    partial = ""
+    history.append({"role": "assistant", "content": f"⏳ {stage_label}…"})
+    while True:
+        if monotonic() - started > MAX_DEEP_RUN_SECONDS:
+            # Watchdog: the UI gives up; the worker thread may finish in the
+            # background (the run lock releases in its finally).
+            history[-1] = {
+                "role": "assistant",
+                "content": "Error: Deep research run timed out after 45 minutes",
+            }
+            yield "", history, state, "⏱ Deep research timed out after 45 minutes"
+            return
+        while True:
+            try:
+                event = event_queue.get_nowait()
+            except Empty:
+                break
+            kind = event[0]
+            if kind == "stage":
+                stage_label = f"⏳ Stage {event[1]} — {event[2]}"
+            elif kind == "section":
+                partial = event[1]
+            elif kind == "done":
+                if result_box["error"] is not None:
+                    raise result_box["error"]
+                result = result_box["result"] or {}
+                answer = result.get("final_answer", "")
+                state["last_report"] = answer
+                state["last_report_query"] = message
+                state["last_report_state"] = result.get("state") or {}
+                history[-1] = {"role": "assistant", "content": answer}
+                yield "", history, state, (
+                    f"✅ Deep research complete · {_elapsed_seconds(started)} — "
+                    "open 'Save Report' to store it as markdown"
+                )
+                return
+        if partial:
+            history[-1] = {"role": "assistant", "content": partial}
+        else:
+            history[-1] = {"role": "assistant", "content": f"{stage_label}…"}
+        yield "", history, state, f"{stage_label} · {_elapsed_seconds(started)}"
+        sleep(0.5)
+
+
+def chat(message: str, history: list[dict] | None, state: dict, file_paths: list[str] | None, debug: bool = False, mode: str = "standard"):
     message = (message or "").strip()
     if not message:
         yield "", history, state, status_text(state)
         return
+
+    set_debug_mode(debug)
 
     history = history or []
     logs = ""
@@ -210,8 +356,15 @@ def chat(message: str, history: list[dict] | None, state: dict, file_paths: list
             yield "", history, state, status
         else:
             status = status_text(state)
-            append_trace_entry(history, logs)
+            # Deep mode deliberately skips the empty "Working…" trace entry:
+            # _chat_deep supplies its own ⏳ starting bubble (logs are empty).
+            if mode != "deep":
+                append_trace_entry(history, logs)
             yield "", history, state, status
+
+        if mode == "deep":
+            yield from _chat_deep(message, history, state)
+            return
 
         log_queue = Queue()
         result_box: dict[str, object] = {"result": None, "error": None}
@@ -223,6 +376,7 @@ def chat(message: str, history: list[dict] | None, state: dict, file_paths: list
                         message,
                         session_id=state["session_id"],
                         verbose=True,
+                        debug_enabled=debug,
                     )
             except Exception as exc:
                 result_box["error"] = exc
@@ -253,6 +407,13 @@ def chat(message: str, history: list[dict] | None, state: dict, file_paths: list
                             history.append({"role": "assistant", "content": result["final_answer"]})
                         else:
                             history[-1] = {"role": "assistant", "content": result["final_answer"]}
+                        # Store report for save button
+                        state["last_report"] = result.get("final_answer", "")
+                        state["last_report_query"] = message
+                        # A standard run has no nested pipeline state: clear any
+                        # stale deep-run state so Save doesn't attach the old
+                        # run's evidence/side-file to this report.
+                        state["last_report_state"] = None
                     yield "", history, state, status
                     return
 

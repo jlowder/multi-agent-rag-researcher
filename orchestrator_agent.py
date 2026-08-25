@@ -3,9 +3,11 @@ import json
 from typing import Any, Dict, Optional
 from memory import (
     build_evidence_context,
+    debug,
     get_session_context,
     save_evidence,
     save_last_user_query,
+    set_debug_mode,
 )
 from worker_agents import (
     retriever_agent,
@@ -13,6 +15,7 @@ from worker_agents import (
     verifier_agent,
     writer_agent,
 )
+from utils.config import get_config
 
 """
 Orchestrator 
@@ -130,51 +133,96 @@ ORCHESTRATOR_TOOL_SCHEMAS = [
             "additionalProperties": False,
         },
     },
+    {
+        "type": "function",
+        "name": "finish_research",
+        "description": (
+            """The research is complete and you have a final verified answer.
+            Use this tool to return the final answer to the user. Call this
+            when you have evidence, a writer draft, and a verifier output —
+            OR when you have exhausted all reasonable re-retrieval attempts
+            and have at least a partial verified answer. Do NOT call this
+            unless you have evidence and a draft that has been verified, or
+            unless re_retrieve_rounds has reached 2."""
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Brief explanation of why research is complete. "
+                        "E.g., 'Verified report is grounded in retrieved evidence.' "
+                        "or 'Exhausted re-retrieval rounds; returning best available answer.'"
+                    ),
+                },
+            },
+            "required": ["reason"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 # Instructions guiding the LLM's behavior in Orchestrator
 ORCHESTRATOR_INSTRUCTIONS = (
     f"""
     You coordinate three worker agents: retriever, writer, and verifier.
+    You also have a finish_research tool to return the final answer.
 
-    Classify each user turn as one of:
-    1. social:
-    greetings, thanks, acknowledgements, brief conversational turns, or closing messages.
-    Examples: "hello", "hi", "thanks", "ok", "bye", "great"
+    RULES — FOLLOW THESE EXACTLY:
+    1. For ANY factual, research, or informational question (about topics, concepts, models, papers, products, companies, people, current events), you MUST call available tools. Do NOT answer from your own knowledge.
+    2. For greetings, thanks, or brief conversational replies, respond in one short sentence WITHOUT calling any tools.
+    3. For clearly non-research requests (coding help, math, unrelated tasks), reply: "I'm a research assistant focused on answering questions about the active documents and on researching the web when needed." WITHOUT calling any tools.
 
-    2. out_of_scope:
-    requests that are not document or web research tasks.
-    Examples: coding help, simple math, or unrelated general tasks.
+    WORKFLOW (follow this order strictly):
+    - First: gather evidence with call_retriever_agent (or reuse_cached_evidence if previous evidence is directly relevant)
+    - Then: write a draft with call_writer_agent using the evidence
+    - Then: verify the draft with call_verifier_agent
+    - If verifier reports gaps AND re_retrieve_rounds < 2: go back to gathering evidence with call_retriever_agent, then repeat write → verify
+    - Once verification is done (or re_retrieve_rounds reaches 2): call finish_research to return the answer
 
-    3. evidence_request:
-    factual or research-style questions that should be answered using evidence from the uploaded documents, the web, or both.
-    Use this for questions about the active PDFs, named topics, concepts, models, papers, products, companies, people, or current events, and for explicit web-search requests.
+    CRITICAL: Do NOT answer directly without calling tools first. Every research question requires evidence retrieval before any answer.
 
-    Rules:
-    - If social, reply naturally in one short sentence and do not call any tools.
-    - If out_of_scope, do not answer the request and do not call any tools.
-    - For out_of_scope, reply briefly: "I'm a research assistant focused on answering questions about the active documents and on researching the web when needed."
-    - Treat factual questions about named topics, concepts, models, products, papers, or companies as evidence_request.
-    - If a question could plausibly be answered from the active PDFs or from web research, prefer evidence_request over out_of_scope.
-    - Only use call_retriever_agent for evidence_request turns.
-    - For evidence_request turns, choose the next valid tool based on the current state.
-    - Activate evidence before writing, and write before verifying.
-    - Return the verifier output when available.
+    State awareness:
+    - If the state indicates needs_more_evidence is True and gap_queries are provided, call call_retriever_agent with a query that specifically addresses those gaps. Do NOT call writer or verifier yet.
+    - If re_retrieve_rounds has reached 2, do NOT re-retrieve again even if gaps remain. Proceed to write and verify with whatever evidence is available, then finish.
+    - Once you have a verified answer (verifier output is available), call finish_research to return it. Do NOT keep calling other tools after the verifier has run.
+    - If you cannot retrieve evidence or the verifier found significant gaps and re_retrieve_rounds is at 2, call finish_research with the draft or partial answer.
+    - If you have evidence and a writer draft but the verifier has NOT yet run, call call_verifier_agent first — do NOT call finish_research yet.
     """
+)
+
+# P0-9: nudge note appended to the orchestrator input when the model ignores
+# tool_choice="required" and returns raw text (thinking + hand-written
+# <function=...> XML) instead of a tool call.
+ORCHESTRATOR_NO_TOOL_CALL_NUDGE = (
+    "Your previous response did not include a valid tool call. You MUST respond "
+    "with exactly one tool call from the available tools (call_retriever_agent, "
+    "call_writer_agent, call_verifier_agent, reuse_cached_evidence, or "
+    "finish_research). Do not write prose, thinking, or XML."
 )
 
 # Format the current orchestration state for the model.
 def build_orchestrator_prompt_context(state: dict[str, Any]) -> str:
     evidence_context = build_evidence_context(state["evidence_json"])
+    status = state.get("verification_status") or {}
     return (
         f"- current_date: {state['current_date']}\n"
         f"- last_user_query: {state['last_user_query'] or 'None'}\n"
         f"- cached_query: {state['cached_query'] or 'None'}\n"
         f"- retrieval_attempted: {state['retrieval_attempted']}\n"
         f"- has_written_draft: {bool(state['written_draft'])}\n"
-        f"- has_verification: {bool(state['verification'])}\n\n"
+        f"- has_verification: {bool(state['verification'])}\n"
+        f"- needs_more_evidence: {state['needs_more_evidence']}\n"
+        f"- re_retrieve_rounds: {state['re_retrieve_rounds']}\n"
+        f"- gap_queries: {state['gap_queries']}\n\n"
         f"Cached evidence summary:\n{state['cached_evidence_summary']}\n\n"
-        f"Current evidence summary:\n{evidence_context['summary']}"
+        f"Current evidence summary:\n{evidence_context['summary']}\n\n"
+        f"Verification status:\n"
+        f"  confidence: {status.get('confidence', 'unknown')}\n"
+        f"  gaps: {status.get('gaps', [])}\n"
+        f"  re_retrieve: {status.get('re_retrieve', False)}"
     )
 
 """
@@ -196,6 +244,7 @@ def orchestrator_agent(
     user_query: str,
     session_id: str = "default",
     verbose: bool = True,
+    debug_enabled: bool = False,
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -205,13 +254,19 @@ def orchestrator_agent(
     Args:
         user_query: The user's query to orchestrate
         session_id: Session ID for memory persistence
-        verbose: Whether to print debug information
+        verbose: Whether to print user-facing trace output
+        debug_enabled: Whether to enable debug-level diagnostic output
         endpoint: Optional custom endpoint URL
         api_key: Optional custom API key
         
     Returns:
         Dict with the orchestration state and results
     """
+    set_debug_mode(debug_enabled)
+    
+    config = get_config()
+    orchestrator_effort = config.get_reasoning_effort("orchestrator")
+    orchestrator_max_output_tokens = config.get_max_output_tokens("orchestrator")
     
     # Load session context for follow-up questions and cached evidence reuse.
     session_context = get_session_context(session_id)
@@ -230,32 +285,114 @@ def orchestrator_agent(
         "evidence_json": "",
         "written_draft": "",
         "verification": "",
+        "verification_status": {},
+        "needs_more_evidence": False,
+        "gap_queries": [],
+        "short_draft": False,
+        "re_retrieve_rounds": 0,
+        "finish_reason": "",              # NEW: reason from finish_research call
         "final_answer": "",
     }
     evidence_already_active = "Evidence is already active for this turn; proceed to writing."
 
+    orchestrator_input = (
+        f"User query: {user_query}\n\n"
+        f"Current state:\n{build_orchestrator_prompt_context(state)}"
+    )
     response = run_model(
         instructions=ORCHESTRATOR_INSTRUCTIONS,
-        reasoning_effort="low",
-        input_data=(
-            f"User query: {user_query}\n\n"
-            f"Current state:\n{build_orchestrator_prompt_context(state)}"
-        ),
+        reasoning_effort=orchestrator_effort,
+        max_output_tokens=orchestrator_max_output_tokens,
+        input_data=orchestrator_input,
         tools=ORCHESTRATOR_TOOL_SCHEMAS,
         agent_name="orchestrator",
         endpoint=endpoint,
         api_key=api_key,
     )
 
-    # Allow up to 4 orchestration rounds before stopping.
-    for _ in range(4):
+    # P0-9: track the last orchestrator call so a no-tool-call response can be
+    # retried exactly once with the nudge note appended to the same input.
+    last_input_data: Any = orchestrator_input
+    last_previous_response_id: Optional[str] = None
+    nudge_used = False
+
+    # Allow up to 10 orchestration rounds before stopping.
+    for _ in range(10):
+        iteration = _ + 1
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"[ORCHESTRATOR] Iteration {iteration}/10")
+            print(f"  state evidence_json len: {len(state['evidence_json'])}")
+            print(f"  state written_draft len: {len(state.get('written_draft', ''))}")
+            print(f"  state verification len: {len(state.get('verification', ''))}")
+            print(f"  needs_more_evidence: {state['needs_more_evidence']}")
+            print(f"  re_retrieve_rounds: {state['re_retrieve_rounds']}")
+            print(f"  gap_queries: {state['gap_queries']}")
+            print(f"  verification_status: {state.get('verification_status', {})}")
+            print(f"{'='*60}")
         function_calls = [item for item in response.output if item.type == "function_call"]
 
-        # If the model does not request any tools, return its direct reply.
+        # P0-9: safe exit when the model ignores tool_choice="required" and
+        # returns raw text (thinking + hand-written <function=...> XML). The
+        # raw text is never used as the final answer: nudge once, then resolve
+        # the answer from the cleanest available state text.
         if not function_calls:
-            state["final_answer"] = response.output_text or "I couldn't find enough evidence to answer that."
+            raw_text = response.output_text or ""
+            print(
+                "[ORCHESTRATOR] WARNING: orchestrator returned text without a tool call: "
+                f"{raw_text[:200]}"
+            )
+            if not nudge_used:
+                nudge_used = True
+                if isinstance(last_input_data, str):
+                    nudge_input: Any = f"{last_input_data}\n\n{ORCHESTRATOR_NO_TOOL_CALL_NUDGE}"
+                else:
+                    nudge_input = list(last_input_data)
+                    for i in range(len(nudge_input) - 1, -1, -1):
+                        item = nudge_input[i]
+                        if isinstance(item, dict) and item.get("type") == "message":
+                            nudge_input[i] = {
+                                **item,
+                                "content": f"{item.get('content', '')}\n\n{ORCHESTRATOR_NO_TOOL_CALL_NUDGE}",
+                            }
+                            break
+                    else:
+                        nudge_input.append({"type": "message", "role": "user", "content": ORCHESTRATOR_NO_TOOL_CALL_NUDGE})
+                print("[ORCHESTRATOR] Retrying orchestrator call once with a tool-call nudge note.")
+                response = run_model(
+                    instructions=ORCHESTRATOR_INSTRUCTIONS,
+                    reasoning_effort=orchestrator_effort,
+                    max_output_tokens=orchestrator_max_output_tokens,
+                    input_data=nudge_input,
+                    tools=ORCHESTRATOR_TOOL_SCHEMAS,
+                    previous_response_id=last_previous_response_id,
+                    agent_name="orchestrator",
+                    endpoint=endpoint,
+                    api_key=api_key,
+                )
+                # Re-parse the retry output on the next loop pass.
+                continue
+            # Nudge already spent (or the retry also returned text): resolve
+            # the final answer from clean state text, never from raw text
+            # except as a last resort.
+            if state["verification"]:
+                state["final_answer"] = state["verification"]
+                answer_source = "verification"
+            elif state["written_draft"]:
+                state["final_answer"] = state["written_draft"]
+                answer_source = "draft"
+            else:
+                state["final_answer"] = raw_text or "I couldn't find enough evidence to answer that."
+                answer_source = "raw-text-fallback"
+            if verbose:
+                print(f"[ORCHESTRATOR] EARLY RETURN: {state['final_answer'][:100]}")
+            print(f"[ORCHESTRATOR] final answer resolved from: {answer_source}")
             save_last_user_query(session_id, user_query)
             return state
+
+        if verbose and function_calls:
+            for fc in function_calls:
+                print(f"[ORCHESTRATOR] LLM called: {fc.name}({fc.arguments})")
 
         tool_outputs = []
 
@@ -274,12 +411,139 @@ def orchestrator_agent(
                     output = f"Reused cached evidence: {args['reason']}"
                 else:
                     output = "No cached evidence is available to reuse."
+                    # No cached evidence and no current evidence — skip ahead
+                    if not state["evidence_json"]:
+                        if verbose:
+                            print("[ORCHESTRATOR] No cached or current evidence. Skipping to finish.")
+                        state["final_answer"] = (
+                            "I couldn't find relevant evidence in the uploaded documents or via web search for this query. "
+                            "Try asking about a topic covered in your documents, or upload a relevant document."
+                        )
+                        save_last_user_query(session_id, user_query)
+                        return state
 
             elif name == "call_retriever_agent":
-                if state["evidence_json"]:
+                # DEBUG: log which branch will fire
+                if state["evidence_json"] and not state["needs_more_evidence"]:
+                    debug("call_retriever_agent → STEP 1 (evidence already active)")
+                elif state["needs_more_evidence"] and state["gap_queries"]:
+                    debug("call_retriever_agent → STEP 2 (gap re-retrieval)")
+                elif state["needs_more_evidence"]:
+                    debug("call_retriever_agent → STEP 3 (gap flag, proceed)")
+                elif state["retrieval_attempted"]:
+                    debug("call_retriever_agent → STEP 4 (already attempted)")
+                else:
+                    debug("call_retriever_agent → STEP 5 (initial retrieval)")
+                # STEP 1: If evidence is already active and no re-retrieval needed, proceed to writing
+                if state["evidence_json"] and not state["needs_more_evidence"]:
                     output = evidence_already_active
+                
+                # STEP 2: Gap-driven re-retrieval (verifier found evidence gaps)
+                elif state["needs_more_evidence"] and state["gap_queries"]:
+                    if verbose:
+                        print("[ORCHESTRATOR] Performing gap-driven re-retrieval...")
+                    state["re_retrieve_rounds"] += 1
+                    state["needs_more_evidence"] = False
+                    gap_context = (
+                        f"Follow-up retrieval to address evidence gaps: {state['gap_queries']}. "
+                        f"Previous evidence is already active; gather complementary or additional evidence."
+                    )
+                    evidence_pack = retriever_agent(
+                        gap_context,
+                        last_user_query=state["last_user_query"],
+                        verbose=verbose,
+                    )
+                    output = evidence_pack.model_dump_json()
+                    evidence_context = build_evidence_context(output)
+                    if evidence_context["has_evidence"]:
+                        try:
+                            new_ev_json = json.loads(output)
+                        except (json.JSONDecodeError, TypeError):
+                            print("[ORCHESTRATOR] Failed to parse retriever output as JSON, skipping merge")
+                            new_ev_json = {}
+                        # Guard against None values from json.loads
+                        if new_ev_json is None:
+                            new_ev_json = {}
+
+                        try:
+                            existing_ev = json.loads(state["evidence_json"]) if state.get("evidence_json") else {}
+                        except (json.JSONDecodeError, TypeError):
+                            existing_ev = {}
+
+                        if not new_ev_json:
+                            print("[ORCHESTRATOR] No evidence in gap retriever output, skipping merge")
+                            state["written_draft"] = ""
+                            state["verification"] = ""
+                            continue
+
+                        # Only proceed with merge if both are valid dicts
+                        if not isinstance(new_ev_json, dict) or not isinstance(existing_ev, dict):
+                            print("[ORCHESTRATOR] Invalid evidence structure, skipping merge")
+                            state["written_draft"] = ""
+                            state["verification"] = ""
+                            continue
+
+                        new_ev_json["query"] = gap_context
+                        has_docs = bool(new_ev_json.get("document_evidence", {}).get("chunks"))
+                        has_web = bool(new_ev_json.get("web_evidence", {}).get("results"))
+                        if has_docs and has_web:
+                            new_ev_json["route_used"] = "both"
+                        elif has_docs:
+                            new_ev_json["route_used"] = "documents"
+                        elif has_web:
+                            new_ev_json["route_used"] = "web"
+                        else:
+                            new_ev_json["route_used"] = "none"
+
+                        # Merge document chunks (dedup by chunk_id)
+                        new_doc_chunks = new_ev_json.get("document_evidence", {}).get("chunks", []) or []
+                        existing_doc_evidence = existing_ev.setdefault("document_evidence", {"query": "", "chunks": []})
+                        if existing_doc_evidence is None:
+                            existing_doc_evidence = {"query": "", "chunks": []}
+                            existing_ev["document_evidence"] = existing_doc_evidence
+                        # Ensure chunks key exists and is a list
+                        if "chunks" not in existing_doc_evidence or existing_doc_evidence["chunks"] is None:
+                            existing_doc_evidence["chunks"] = []
+                        existing_doc_ids = {c.get("chunk_id") for c in existing_doc_evidence.get("chunks", [])}
+                        for chunk in new_doc_chunks:
+                            if chunk.get("chunk_id") not in existing_doc_ids:
+                                existing_doc_evidence["chunks"].append(chunk)
+
+                        # Merge web results (dedup by url)
+                        new_web = new_ev_json.get("web_evidence", {}).get("results", []) or []
+                        existing_web = existing_ev.setdefault("web_evidence", {"query": "", "results": []})
+                        if existing_web is None:
+                            existing_web = {"query": "", "results": []}
+                            existing_ev["web_evidence"] = existing_web
+                        # Ensure results key exists and is a list
+                        if "results" not in existing_web or existing_web["results"] is None:
+                            existing_web["results"] = []
+                        existing_web_urls = {r.get("url", "") for r in (existing_web.get("results") or [])}
+                        for result in new_web:
+                            if result.get("url", "") not in existing_web_urls:
+                                existing_web["results"].append(result)
+
+                        state["evidence_json"] = json.dumps(existing_ev)
+                        state["cached_evidence_summary"] = evidence_context["summary"]
+                    else:
+                        output = evidence_pack.summary or "Retriever could not gather additional evidence."
+                    state["written_draft"] = ""
+                    state["verification"] = ""
+                    state["verification_status"] = {}
+                    state["retrieval_attempted"] = True
+                    output = f"Re-retrieved evidence for gaps. New evidence accumulated."
+                
+                # STEP 3: Gap flagged but no queries — proceed to write
+                elif state["needs_more_evidence"]:
+                    state["needs_more_evidence"] = False
+                    state["gap_queries"] = []
+                    output = "Proceeding to write with available evidence."
+                
+                # STEP 4: Already retrieved this turn — skip
                 elif state["retrieval_attempted"]:
                     output = "Retrieval has already been attempted for this turn."
+                
+                # STEP 5: Initial retrieval — gather evidence
                 else:
                     state["retrieval_attempted"] = True
                     if verbose:
@@ -290,15 +554,43 @@ def orchestrator_agent(
                         verbose=verbose,
                     )
                     output = evidence_pack.model_dump_json()
-                    evidence_context = build_evidence_context(output)
-                    if evidence_context["has_evidence"]:
+
+                    # DEBUG: print the entire JSON structure to diagnose parsing
+                    try:
+                        parsed = json.loads(output)
+                        debug(f"evidence_pack.model_dump() keys: {list(parsed.keys())}")
+                        debug(f"document_evidence type: {type(parsed.get('document_evidence')).__name__}, value preview: {str(parsed.get('document_evidence'))[:300]}")
+                    except Exception as e:
+                        debug(f"Could not re-parse output: {e}")
+
+                    # DEBUG: log what the retriever actually returned
+                    debug(f"Retriever returned: query='{evidence_pack.query}', route='{evidence_pack.route_used}', summary='{evidence_pack.summary[:100]}...'")
+                    doc_chunks = len(evidence_pack.document_evidence.get("chunks", [])) if evidence_pack.document_evidence else 0
+                    web_results = len(evidence_pack.web_evidence.get("results", [])) if evidence_pack.web_evidence else 0
+                    debug(f"Retriever found: {doc_chunks} doc chunks, {web_results} web results")
+
+                    # Check evidence using the Pydantic model as source of truth
+                    has_docs = bool(evidence_pack.document_evidence and evidence_pack.document_evidence.get("chunks"))
+                    has_web = bool(evidence_pack.web_evidence and evidence_pack.web_evidence.get("results"))
+
+                    if has_docs or has_web:
+                        # Evidence found — store it and continue normal flow
                         state["evidence_json"] = output
                         state["cached_query"] = state["user_query"]
-                        # save retrieved evidence
                         save_evidence(session_id, state["user_query"], output)
+                        debug(f"SET state['evidence_json'] length: {len(output)} chars")
+                        evidence_context = build_evidence_context(output)
                         state["cached_evidence_summary"] = evidence_context["summary"]
                     else:
-                        output = evidence_pack.summary or "Retriever could not gather enough evidence."
+                        # NO EVIDENCE FOUND — skip writer/verifier entirely, return directly
+                        if verbose:
+                            print("[ORCHESTRATOR] Retriever returned no evidence. Returning directly.")
+                        state["final_answer"] = (
+                            "I couldn't find relevant evidence in the uploaded documents or via web search for this query. "
+                            "Try asking about a topic covered in your documents, or upload a relevant document."
+                        )
+                        save_last_user_query(session_id, user_query)
+                        return state
 
             elif name in {"call_writer_agent", "call_verifier_agent"}:
                 evidence_context = build_evidence_context(
@@ -308,7 +600,20 @@ def orchestrator_agent(
                 formatted_evidence = evidence_context["formatted_evidence"]
                 if name == "call_writer_agent":
                     if not formatted_evidence:
+                        debug("call_writer_agent → NO evidence (formatted_evidence empty)")
+                    else:
+                        debug(f"call_writer_agent → HAS evidence (formatted_evidence length: {len(formatted_evidence)})")
+                    if not formatted_evidence:
                         output = "Cannot write yet because no retrieval evidence has been activated."
+                        # No evidence — skip to finish immediately
+                        if verbose:
+                            print("[ORCHESTRATOR] No evidence for writer. Skipping to finish.")
+                        state["final_answer"] = (
+                            "I couldn't find relevant evidence in the uploaded documents or via web search for this query. "
+                            "Try asking about a topic covered in your documents, or upload a relevant document."
+                        )
+                        save_last_user_query(session_id, user_query)
+                        return state
                     else:
                         if verbose:
                             print("[ORCHESTRATOR] Initializing Writer Agent...")
@@ -318,6 +623,25 @@ def orchestrator_agent(
                             verbose=verbose,
                         )
                         state["written_draft"] = output
+                        if verbose:
+                            print(f"[ORCHESTRATOR] Writer output (first 200 chars): {output[:200]}")
+                            print(f"[ORCHESTRATOR] Writer output length: {len(output)} chars")
+                        # P0-8: feed the (formerly dead) length gate to the verifier's depth check
+                        state["short_draft"] = len(state.get("written_draft", "")) < 1500
+                        if verbose:
+                            print(f"[ORCHESTRATOR] Draft length: {len(state['written_draft'])} chars (short_draft={state['short_draft']})")
+                        # If the writer produced almost nothing, evidence wasn't usable
+                        if len(output.strip()) < 50:
+                            if verbose:
+                                print("[ORCHESTRATOR] Writer produced negligible output. Evidence wasn't usable.")
+                            state["final_answer"] = (
+                                "The retrieved evidence wasn't sufficient to write a meaningful answer. "
+                                "The documents may not cover this topic. Try a different query or upload relevant documents."
+                            )
+                            save_last_user_query(session_id, user_query)
+                            if verbose:
+                                print(f"[ORCHESTRATOR] EARLY RETURN: {state['final_answer'][:100]}")
+                            return state
                 elif not state["written_draft"]:
                     output = "Cannot verify yet because no report draft exists."
                 elif not formatted_evidence:
@@ -325,13 +649,74 @@ def orchestrator_agent(
                 else:
                     if verbose:
                         print("[ORCHESTRATOR] Initializing Verifier Agent...")
-                    output = verifier_agent(
+                    # Route signal for the verifier's status dict (P0-2): computed
+                    # from the active evidence in state, not from text sniffing.
+                    try:
+                        active_ev = json.loads(state["evidence_json"]) if state.get("evidence_json") else {}
+                    except (json.JSONDecodeError, TypeError):
+                        active_ev = {}
+                    if not isinstance(active_ev, dict):
+                        active_ev = {}
+                    has_doc_evidence = bool((active_ev.get("document_evidence") or {}).get("chunks"))
+                    has_web_evidence = bool((active_ev.get("web_evidence") or {}).get("results"))
+
+                    # P0-3: verifier returns (clean_text, status_dict)
+                    output, verification_status = verifier_agent(
                         user_query=state["user_query"],
                         written_draft=state["written_draft"],
                         evidence_text=formatted_evidence,
                         verbose=verbose,
+                        has_doc_evidence=has_doc_evidence,
+                        has_web_evidence=has_web_evidence,
+                        short_draft=bool(state.get("short_draft", False)),
                     )
                     state["verification"] = output
+                    state["verification_status"] = verification_status
+                    if verbose:
+                        print(f"[ORCHESTRATOR] Verifier output (first 200 chars): {output[:200]}")
+                        print(f"[ORCHESTRATOR] Verification status: {verification_status}")
+                    debug(f"Verifier output length: {len(output)} chars (clean text, no EVIDENCE_STATUS block)")
+
+                    # P0-2/P0-3/P0-4: act ONLY on the verifier's re_retrieve bool.
+                    # Gap queries come only from the critic (no boilerplate
+                    # fallback, no coverage/depth substring overrides).
+                    if verification_status.get("re_retrieve") and state["re_retrieve_rounds"] < 2:
+                        gap_queries = list(verification_status.get("gap_queries", []))
+                        specific_queries = list(verification_status.get("specific_queries", []))
+                        if not gap_queries and not specific_queries:
+                            debug("[ORCHESTRATOR] re_retrieve requested but no specific gap queries — skipping")
+                            state["needs_more_evidence"] = False
+                            state["gap_queries"] = []
+                        else:
+                            state["needs_more_evidence"] = True
+                            state["gap_queries"] = specific_queries or gap_queries
+                            if verbose:
+                                print(f"[ORCHESTRATOR] Verifier flagged {len(gap_queries)} gaps. Triggering gap-driven re-retrieval.")
+                    else:
+                        state["needs_more_evidence"] = False
+                        state["gap_queries"] = []
+
+            elif name == "finish_research":
+                reason = args.get("reason", "Research complete.")
+                state["finish_reason"] = reason
+                if state["verification"]:
+                    state["final_answer"] = state["verification"]
+                    save_last_user_query(session_id, user_query)
+                    if verbose:
+                        print(f"[ORCHESTRATOR] EARLY RETURN: {state['final_answer'][:100]}")
+                    return state
+                elif state["written_draft"]:
+                    state["final_answer"] = state["written_draft"]
+                    save_last_user_query(session_id, user_query)
+                    if verbose:
+                        print(f"[ORCHESTRATOR] EARLY RETURN: {state['final_answer'][:100]}")
+                    return state
+                else:
+                    state["final_answer"] = f"Research finished: {reason}"
+                    save_last_user_query(session_id, user_query)
+                    if verbose:
+                        print(f"[ORCHESTRATOR] EARLY RETURN: {state['final_answer'][:100]}")
+                    return state
 
             else:
                 output = "Unknown tool name."
@@ -340,30 +725,53 @@ def orchestrator_agent(
                 {
                     "type": "function_call_output",
                     "call_id": call.call_id,
+                    "tool_name": call.name,
                     "output": output,
                 }
             )
 
+        # Log tool outputs for debugging
+        for to in tool_outputs:
+            if isinstance(to, dict) and "output" in to:
+                debug(f"Tool output ({to['tool_name']}): {str(to['output'])[:200]}...")
+
+        # Log what LLM returned this iteration
+        if not function_calls:
+            debug(f"LLM returned NO tool calls. Output text: {response.output_text[:200]}")
+        else:
+            for fc in function_calls:
+                debug(f"LLM returned tool call: {fc.name} with {len(fc.arguments)} args")
+
+        next_input_data = [
+            *tool_outputs,
+            {
+                "type": "message",
+                "role": "user",
+                "content": f"Updated state:\n{build_orchestrator_prompt_context(state)}",
+            },
+        ]
         response = run_model(
             instructions=ORCHESTRATOR_INSTRUCTIONS,
-            reasoning_effort="low",
-            input_data=[
-                *tool_outputs,
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": f"Updated state:\n{build_orchestrator_prompt_context(state)}",
-                },
-            ],
+            reasoning_effort=orchestrator_effort,
+            max_output_tokens=orchestrator_max_output_tokens,
+            input_data=next_input_data,
             tools=ORCHESTRATOR_TOOL_SCHEMAS,
             previous_response_id=response.id,
         )
+        last_input_data = next_input_data
+        last_previous_response_id = response.id
 
     if state["verification"]:
         state["final_answer"] = state["verification"]
         save_last_user_query(session_id, user_query)
+    elif state["written_draft"]:
+        state["final_answer"] = state["written_draft"]
+        save_last_user_query(session_id, user_query)
     else:
-        state["final_answer"] = "Stopped because the maximum number of orchestration steps was reached."
+        state["final_answer"] = (
+            "The research system encountered an issue processing your query. "
+            "Please try again with a more specific question."
+        )
 
     if verbose:
         print("[ORCHESTRATOR] Workflow complete.")
