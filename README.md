@@ -223,11 +223,16 @@ See [LOCAL_LLM_SETUP.md](LOCAL_LLM_SETUP.md) for configuration examples for Olla
 
 ### Saved Reports
 
-Both modes save each answer to a timestamped `reports/<query-slug>_<timestamp>.md` file through the same flow: uncapped body and verification text, capped evidence snippets, and verification metadata (confidence level, coverage) in the report header.
+Deep mode's canonical output is a validated structured document (Pydantic v2, `models/report_schema.py`). Each deep run saves a timestamped set of files to `reports/`:
 
-In deep mode the report is an executive summary, one section per sub-question, and a `## References` section numbered `[1..N]` by first appearance in the body. Every inline citation resolves to a reference entry: local documents show title, source file, and page; web results show title, URL, and date.
+- `<query-slug>_<timestamp>.json` — the structured document: metadata, executive summary, one section per sub-question (typed content blocks with per-span citations), CSL-JSON-style sources, and quality metrics (citation density, verification status, unresolvable citations).
+- `<query-slug>_<timestamp>.sources.json` — the sources array on its own, for downstream document generation.
+- `<query-slug>_<timestamp>.markdown.md` — a deterministic Markdown rendering of the same document, for copy-paste and debugging.
+- `<query-slug>_<timestamp>.evidence.md` — the raw-evidence side file (verification summary plus capped evidence snippets), written by the CLI and UI.
 
-An optional raw-evidence side-file (`<report-stem>.evidence.md`, written next to the report) is enabled by passing `include_evidence_dump=True` in `save_report`'s `ReportConfig`; it is off by default in both modes.
+Inline citations resolve to references numbered by first appearance: local documents show title, source file, and page; web results show title, URL, and date.
+
+Standard mode is unchanged: it saves a single `reports/<query-slug>_<timestamp>.md` file with uncapped body and verification text. An optional raw-evidence side-file (`<report-stem>.evidence.md`) can be enabled with `include_evidence_dump=True` in `save_report`'s `ReportConfig`.
 
 ## Run UI for Multi-Agent Chat
 

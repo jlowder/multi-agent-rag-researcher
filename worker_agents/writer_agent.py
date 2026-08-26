@@ -187,7 +187,7 @@ def writer_agent(
     verbose: bool = False,
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
-    output_format: str = "markdown",
+    output_format: str = "json",
 ) -> str | Report:
     """
     Execute the writer agent.
@@ -380,7 +380,7 @@ def write_section(
     verbose: bool = False,
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
-    output_format: str = "markdown",
+    output_format: str = "json",
 ) -> str | Section:
     """
     Write ONE section of the deep-research report (P1-3).
@@ -511,7 +511,7 @@ def write_synthesis(
     verbose: bool = False,
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
-    output_format: str = "markdown",
+    output_format: str = "json",
 ) -> str | Section:
     """
     Write the final cross-section Synthesis section (P2-4a).

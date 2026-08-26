@@ -201,7 +201,7 @@ def test_write_section_json_citations_detectable(monkeypatch):
 
 def test_write_section_markdown_mode_unchanged(monkeypatch):
     text = "## Market\n\nBody [D1]."
-    result, calls = _write_section(monkeypatch, text)
+    result, calls = _write_section(monkeypatch, text, output_format="markdown")
     assert isinstance(result, str)
     assert result.startswith("## Market")
     assert "ONE JSON object" not in calls[0]["instructions"]  # markdown prompt used

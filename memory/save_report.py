@@ -613,7 +613,8 @@ def save_report(
     config: Optional[ReportConfig] = None
 ) -> str:
     """Save a research report to a markdown file with comprehensive structure.
-    
+
+    Standard-mode path (Markdown). Deep mode saves via save_structured_report.    
     This function generates a richly formatted markdown report from the provided
     content and optional evidence state, then saves it to a timestamped file.
     

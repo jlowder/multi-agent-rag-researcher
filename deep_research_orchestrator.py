@@ -499,7 +499,7 @@ def deep_research(
     on_stage: Optional[Callable[[int, str], None]] = None,
     on_section: Optional[Callable[[int, int, str, str, str], None]] = None,
     session_id: Optional[str] = None,
-    output_format: str = "markdown",
+    output_format: str = "json",
 ) -> dict:
     """
     Run the 5-stage deep-research pipeline (plan Section B).

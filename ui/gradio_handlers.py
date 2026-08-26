@@ -209,6 +209,20 @@ def handle_save_report(state: dict) -> str:
     from memory.save_report import save_report, ReportConfig
     session_id = state.get("session_id", "default")
     report_state = state.get("last_report_state")
+    if isinstance(report_state, dict) and report_state.get("report_json"):
+        # Deep-mode structured output (Phase 5): save the canonical
+        # structured document (JSON + sources + Markdown side export).
+        from memory.save_report import save_structured_report
+        from models.report_schema import ResearchReport
+
+        config = ReportConfig.research()
+        config.include_evidence_dump = True
+        path = save_structured_report(
+            ResearchReport.model_validate_json(report_state["report_json"]),
+            state=report_state,
+            config=config,
+        )
+        return f"Report saved to: {path}"
     if isinstance(report_state, dict) and report_state:
         # Deep mode: the NESTED pipeline state (top-level evidence_json,
         # verification, verification_status) enriches the saved report with
