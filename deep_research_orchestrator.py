@@ -1234,7 +1234,9 @@ def deep_research(
                 f"complete (structured): {len(sections)} section(s), "
                 f"{len(report.report.sources)} source(s)",
             )
-            final_answer = ""
+            from memory.save_report import render_markdown as _render_markdown
+
+            final_answer = _render_markdown(report)
             return _finish(final_answer)
 
         # (b) References resolved deterministically from the cited keys.

@@ -973,3 +973,214 @@ def is_valid_report_path(filepath: Union[str, Path]) -> bool:
     except ValueError:
         # Path is not relative to reports directory
         return False
+
+
+# =============================================================================
+# Structured reports (Phase 4, plan section 7)
+# =============================================================================
+
+
+def _render_span(text: str, citations) -> str:
+    """Render one span: its text followed by [^n] footnote markers."""
+    out = text or ""
+    for c in citations or []:
+        out += f"[^{c}]"
+    return out
+
+
+def _render_block(block) -> List[str]:
+    """Render one ReportBlock to Markdown lines (no trailing blank line)."""
+    lines: List[str] = []
+    btype = block.type
+    if btype == "heading":
+        level = max(1, min(6, int(block.level or 3)))
+        text = (
+            "".join(_render_span(s.text, s.citations) for s in block.spans)
+            or block.text
+        )
+        lines.append("#" * level + " " + text.strip())
+    elif btype == "paragraph":
+        if block.spans:
+            text = "".join(_render_span(s.text, s.citations) for s in block.spans)
+        else:
+            text = block.text
+        lines.append(text.strip())
+    elif btype in ("ordered_list", "unordered_list"):
+        for i, item in enumerate(block.items or []):
+            marker = f"{i + 1}." if btype == "ordered_list" else "-"
+            lines.append(f"{marker} {_render_span(item.text, item.citations)}")
+    elif btype == "callout":
+        body = (
+            "".join(_render_span(s.text, s.citations) for s in block.spans)
+            or block.text
+        )
+        label = block.callout_title or block.callout_type.title()
+        lines.append(f"> **{label}:** {body.strip()}")
+    elif btype == "comparison_table":
+        cols = list(block.columns or [])
+        rows = list(block.rows or [])
+        if not cols and rows:
+            cols = [f"col{i + 1}" for i in range(len(rows[0]))]
+
+        def _cell(c) -> str:
+            cell_text = getattr(c, "text", None)
+            if isinstance(cell_text, str):
+                return _render_span(cell_text, getattr(c, "citations", [])).strip()
+            if isinstance(c, list):
+                return " ".join(_render_span(s.text, s.citations) for s in c).strip()
+            return str(c).strip()
+
+        if cols:
+            lines.append("| " + " | ".join(cols) + " |")
+            lines.append("| " + " | ".join("---" for _ in cols) + " |")
+            for r in rows:
+                lines.append("| " + " | ".join(_cell(c) for c in r) + " |")
+    elif btype == "code_block":
+        lang = (block.language or "").strip()
+        lines.append(f"```{lang}")
+        lines.append((block.text or "").rstrip("\n"))
+        lines.append("```")
+    elif btype == "page_break":
+        lines.append("---")
+    elif btype == "citation_note":
+        body = (
+            "".join(_render_span(s.text, s.citations) for s in block.spans)
+            or block.text
+        )
+        lines.append(f"> {body.strip()}")
+    else:
+        if block.text:
+            lines.append(block.text.strip())
+    return [l for l in lines if l != ""]
+
+
+def render_markdown(report) -> str:
+    """Deterministic Markdown rendering of a structured report (plan 7.3).
+
+    Debug / copy-paste export only — the canonical output is JSON. Accepts a
+    ResearchReport or the inner Report. Citations render as [^n] footnote
+    markers; references render as [^n]: definition lines in source order
+    (sources are stored in first-cited-key order, which matches the marker
+    numbers). Deterministic; raises TypeError on other input types.
+    """
+    from models.report_schema import Report as _Report
+    from models.report_schema import ResearchReport as _ResearchReport
+
+    if isinstance(report, _ResearchReport):
+        report = report.report
+    if not isinstance(report, _Report):
+        raise TypeError(
+            f"render_markdown expects a Report/ResearchReport, "
+            f"got {type(report).__name__}"
+        )
+
+    lines: List[str] = []
+    meta = report.metadata
+    lines.append(f"# {meta.title}")
+    lines.append("")
+    if meta.subtitle:
+        lines.append(f"*{meta.subtitle}*")
+        lines.append("")
+
+    if report.executive_summary:
+        lines.append("## Executive Summary")
+        lines.append("")
+        for para in report.executive_summary:
+            lines.append(str(para).strip())
+            lines.append("")
+
+    for section in report.sections:
+        lines.append(f"### {section.heading}")
+        lines.append("")
+        for block in section.blocks:
+            block_lines = _render_block(block)
+            if block_lines:
+                lines.extend(block_lines)
+                lines.append("")
+
+    sources = list(report.sources or [])
+    if sources:
+        if lines and lines[-1] != "":
+            lines.append("")
+        for i, s in enumerate(sources, start=1):
+            label = (s.title or s.URL or s.id).strip()
+            lines.append(f"[^{i}]: {label}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def save_structured_report(
+    report,
+    output_dir: Optional[Path] = None,
+    state: Optional[JsonDict] = None,
+    config: Optional[ReportConfig] = None,
+) -> str:
+    """Save a validated structured report to reports/ (plan section 7.1).
+
+    Writes, all sharing the stem {safe_query}_{timestamp}:
+    - {stem}.json         — the canonical structured document
+    - {stem}.sources.json — standalone sources array (for the doc-gen project)
+    - {stem}.markdown.md  — deterministic Markdown export (render_markdown)
+    - {stem}.evidence.md  — evidence side file when state carries evidence
+      (unchanged behavior from save_report, plan 7.4)
+
+    Returns the path (str) of the canonical .json file.
+    """
+    import json
+
+    from models.report_schema import (
+        QualityMetrics as _QualityMetrics,
+        Report as _Report,
+        ResearchReport as _ResearchReport,
+    )
+
+    if isinstance(report, _Report):
+        report = _ResearchReport(report=report, quality=_QualityMetrics())
+    if not isinstance(report, _ResearchReport):
+        raise TypeError(
+            f"save_structured_report expects a ResearchReport, "
+            f"got {type(report).__name__}"
+        )
+
+    if output_dir is None:
+        reports_dir = Path(__file__).parent.parent / "reports"
+    else:
+        reports_dir = output_dir
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = config or ReportConfig.default()
+    _valid, safe_query = _validate_query(report.report.metadata.query or "")
+    if not safe_query:
+        safe_query = "untitled"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = f"{safe_query}_{timestamp}"
+
+    json_path = reports_dir / f"{stem}.json"
+    sources_path = reports_dir / f"{stem}.sources.json"
+    markdown_path = reports_dir / f"{stem}.markdown.md"
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        f.write(report.model_dump_json(indent=2))
+    with open(sources_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps([s.model_dump() for s in report.report.sources], indent=2))
+    with open(markdown_path, "w", encoding="utf-8") as f:
+        f.write(render_markdown(report))
+
+    if cfg.include_evidence_dump and state and isinstance(state, dict):
+        document_chunks, web_results = _parse_evidence_json(
+            state.get("evidence_json", "")
+        )
+        if document_chunks or web_results:
+            evidence_path = json_path.with_name(f"{json_path.stem}.evidence.md")
+            evidence_markdown = _build_evidence_markdown(
+                document_chunks,
+                web_results,
+                state.get("verification_status", {}),
+                cfg,
+            )
+            with open(evidence_path, "w", encoding="utf-8") as f:
+                f.write(evidence_markdown)
+
+    logger.debug(f"save_structured_report: wrote {json_path}")
+    return str(json_path)

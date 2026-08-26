@@ -408,8 +408,11 @@ def test_deep_research_json_mode_e2e(monkeypatch):
         "test research query", verbose=False, max_rounds=3, output_format="json"
     )
 
-    # JSON mode: no Markdown final_answer; report_json carries the document.
-    assert result["final_answer"] == ""
+    # JSON mode: final_answer is the deterministic Markdown rendering
+    # (Phase 4); report_json carries the canonical document.
+    assert result["final_answer"].startswith("# Test Report Title")
+    assert "[^1]" in result["final_answer"]
+    assert "## Executive Summary" in result["final_answer"]
     state = result["state"]
     assert "report_json" in state
     rep = ResearchReport.model_validate_json(state["report_json"])
