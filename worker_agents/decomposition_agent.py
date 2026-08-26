@@ -57,6 +57,14 @@ class ResearchPlan(BaseModel):
         description="True only for a single narrow factual question",
     )
     sub_questions: List[SubQuestion] = Field(default_factory=list)
+    report_title: str = Field(
+        default="",
+        description=(
+            "Short descriptive title (max 10 words) for the final report; "
+            "not a restatement of the query. Optional: left empty when "
+            "uncertain."
+        ),
+    )
 
 
 DECOMPOSER_INSTRUCTIONS = """
@@ -84,6 +92,7 @@ Rules:
 - If the query is a single narrow factual question (not a request for a
   comprehensive report or broad coverage), set is_simple=true and return
   exactly ONE sub-question that restates the query.
+- report_title: a short descriptive title (max 10 words, no trailing punctuation) for the final report, not a restatement of the query.
 - Return only the structured plan; no prose.
 """
 
@@ -230,6 +239,7 @@ def _plain_text_plan_json(
         "(fill in the values, repeat the sub_questions entry per question):\n"
         '{\n'
         '  "is_simple": false,\n'
+        '  "report_title": "...",\n'
         '  "sub_questions": [\n'
         '    {"id": "sq1", "question": "...", "angle": "...", '
         '"expected_sources": "doc", "priority": 1, "heading": "..."}\n'

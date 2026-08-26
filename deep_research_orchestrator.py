@@ -53,6 +53,12 @@ from worker_agents.retriever_agent import retriever_agent
 from worker_agents.verifier_agent import verification_critic
 from worker_agents.writer_agent import write_section, write_synthesis
 from utils.config import get_config
+from deep_research_structured import (
+    EXEC_SUMMARY_JSON_INSTRUCTIONS,
+    assemble_structured_report,
+    parse_exec_summary,
+    sections_plain_text,
+)
 
 # Global LLM call budget for one deep-research run (plan B / P2-3 ≈ 40).
 # Worst-case tracked calls ≈ 45: decompose(1) + sufficiency/investigation
@@ -493,6 +499,7 @@ def deep_research(
     on_stage: Optional[Callable[[int, str], None]] = None,
     on_section: Optional[Callable[[int, int, str, str, str], None]] = None,
     session_id: Optional[str] = None,
+    output_format: str = "markdown",
 ) -> dict:
     """
     Run the 5-stage deep-research pipeline (plan Section B).
@@ -528,6 +535,7 @@ def deep_research(
         question packs, citation registry/maps, sections, critic report).
     """
     started = time.time()
+    output_format = "markdown" if output_format not in ("markdown", "json") else output_format
     if session_id is None:
         session_id = str(uuid4())
     budget = _LLMBudget(MAX_LLM_CALLS)
@@ -582,6 +590,14 @@ def deep_research(
                 f"[DEEP] WARNING: on_stage callback failed "
                 f"({type(exc).__name__}: {exc}); continuing."
             )
+
+    def _section_text_str(section_text: Any) -> str:
+        """String view of a section entry: the Markdown string itself in
+        Markdown mode; sections_plain_text() of the Section model in JSON
+        mode (cited spans rendered as "text [D1, W2]")."""
+        if isinstance(section_text, str):
+            return section_text
+        return sections_plain_text(section_text)
 
     def _notify_section(
         index: int, total: int, heading: str, section_text: str,
@@ -788,7 +804,7 @@ def deep_research(
                 section_docs, section_webs, doc_key_map, web_key_map
             )
             prior_summaries = "\n".join(
-                f"- {sec_heading}: {_one_line_summary(sec_text)}"
+                f"- {sec_heading}: {_one_line_summary(_section_text_str(sec_text))}"
                 for _sid, sec_heading, sec_text in sections
             )
             section_context = (
@@ -806,6 +822,7 @@ def deep_research(
                     verbose=verbose,
                     endpoint=endpoint,
                     api_key=api_key,
+                    output_format=output_format,
                 )
             except _BudgetExhausted:
                 print(
@@ -827,8 +844,8 @@ def deep_research(
                 len(sections),
                 len(sub_questions),
                 heading,
-                section_text,
-                "\n\n".join(text for _sid, _h, text in sections),
+                _section_text_str(section_text),
+                "\n\n".join(_section_text_str(text) for _sid, _h, text in sections),
             )
         draft_extra = f"sections={len(sections)}"
         if stats["section_failures"]:
@@ -840,7 +857,7 @@ def deep_research(
         # ------------------------------------------------------------------
         _notify_stage(4, "critic pass: checking every drafted section")
         if sections:
-            draft_text = "\n\n".join(text for _sid, _h, text in sections)
+            draft_text = "\n\n".join(_section_text_str(text) for _sid, _h, text in sections)
             section_ids = [sq_id for sq_id, _h, _t in sections]
             if budget.can_afford(1):
                 critic = verification_critic(
@@ -965,7 +982,7 @@ def deep_research(
                     )
                     _sid, heading, _old_text = sections[index]
                     prior_summaries = "\n".join(
-                        f"- {sec_heading}: {_one_line_summary(sec_text)}"
+                        f"- {sec_heading}: {_one_line_summary(_section_text_str(sec_text))}"
                         for i, (_s, sec_heading, sec_text) in enumerate(sections)
                         if i != index
                     )
@@ -985,6 +1002,7 @@ def deep_research(
                             verbose=verbose,
                             endpoint=endpoint,
                             api_key=api_key,
+                            output_format=output_format,
                         )
                     except _BudgetExhausted:
                         print(
@@ -1038,14 +1056,15 @@ def deep_research(
                 budget.charge("synthesis", verbose=verbose)
                 synthesis_text = write_synthesis(
                     user_query,
-                    [(heading, text) for _sid, heading, text in sections],
+                    [(heading, _section_text_str(text)) for _sid, heading, text in sections],
                     verbose=verbose,
                     endpoint=endpoint,
                     api_key=api_key,
+                    output_format=output_format,
                 )
                 sections.append(("synthesis", "Synthesis", synthesis_text))
                 stats["synthesis_words"] = len(
-                    re.findall(r"\b\w+\b", synthesis_text)
+                    re.findall(r"\b\w+\b", _section_text_str(synthesis_text))
                 )
                 if verbose:
                     print(
@@ -1074,17 +1093,18 @@ def deep_research(
         _notify_stage(5, "assembling final report")
         # (a) Executive summary, written LAST.
         exec_summary = ""
+        exec_summary_paragraphs: List[str] = []
         if sections:
             if budget.can_afford(1):
                 summaries = "\n".join(
-                    f"- {heading}: {_one_line_summary(text)}"
+                    f"- {heading}: {_one_line_summary(_section_text_str(text))}"
                     for _sid, heading, text in sections
                 )
                 try:
                     budget.charge("exec-summary", verbose=verbose)
                     config = get_config()
                     response = run_model(
-                        instructions=EXEC_SUMMARY_INSTRUCTIONS,
+                        instructions=(EXEC_SUMMARY_JSON_INSTRUCTIONS if output_format == "json" else EXEC_SUMMARY_INSTRUCTIONS),
                         input_data=(
                             f"User query: {user_query}\n\n"
                             f"Section summaries of the finished report:\n{summaries}"
@@ -1110,6 +1130,8 @@ def deep_research(
                         # (same as standard mode), so the pipeline must not add a
                         # second one.
                         exec_summary = summary_prose
+                        if output_format == "json":
+                            exec_summary_paragraphs = parse_exec_summary(summary_prose)
                 except Exception as exc:
                     # Transient LLM failure: assemble WITHOUT an executive
                     # summary (sections + references only). Never crash.
@@ -1123,6 +1145,97 @@ def deep_research(
                     "[DEEP] WARNING: LLM budget exhausted before the executive "
                     "summary; assembling without one."
                 )
+
+        merged_pack = {
+            "query": user_query,
+            "route_used": infer_route_used(all_doc, all_web),
+            "summary": (
+                f"Deep research evidence: {len(all_doc)} doc chunk(s) and "
+                f"{len(all_web)} web result(s) across {len(packs)} sub-question(s)."
+            ),
+            "document_evidence": {
+                "query": user_query,
+                "summary": "Merged per-sub-question document evidence (deduped).",
+                "chunks": all_doc,
+            },
+            "web_evidence": {
+                "query": user_query,
+                "summary": "Merged per-sub-question web evidence (deduped).",
+                "results": all_web,
+            },
+        }
+
+        if critic:
+            coverage = {
+                "high": "comprehensive",
+                "medium": "moderate",
+                "low": "thin",
+            }.get(critic.get("confidence_level"), "moderate")
+            state["verification_status"] = {
+                "confidence": critic.get("confidence_level", "medium"),
+                "coverage": coverage,
+                "gaps": [
+                    g
+                    for verdict in critic.get("per_section") or []
+                    if isinstance(verdict, dict)
+                    for g in (verdict.get("gaps") or [])
+                    if g and g.strip()
+                ],
+            }
+        else:
+            state["verification_status"] = {
+                "confidence": "medium",
+                "coverage": "moderate",
+                "gaps": [],
+            }
+
+        state["evidence_json"] = json.dumps(merged_pack)
+
+        if output_format == "json":
+            # Structured assembly (plan section 6): validate the sections,
+            # renumber citation keys to rendered 1..N, map the registry to
+            # CSL-JSON sources, and compute quality metrics.
+            plan_val = state.get("plan")
+            plan_title = (
+                str(plan_val.get("report_title") or "").strip()
+                if isinstance(plan_val, dict)
+                else ""
+            )
+            report_title = plan_title or (user_query[:100].strip() or "Research Report")
+            report = assemble_structured_report(
+                sections=[text for _s, _h, text in sections],
+                registry=registry,
+                user_query=user_query,
+                session_id=session_id or "default",
+                exec_paragraphs=exec_summary_paragraphs,
+                verification_status=state["verification_status"],
+                title=report_title,
+                subtitle="",
+            )
+            state["report_json"] = report.model_dump_json()
+            state["sections"] = [
+                {"id": sq_id, "heading": heading, "text": _section_text_str(text)}
+                for sq_id, heading, text in sections
+            ]
+            state["verification"] = ""
+            state["draft"] = ""
+            state["citation_density"] = report.quality.citation_density
+            unresolvable_flagged = report.quality.verification.get(
+                "unresolvable_citations", []
+            )
+            assembly_extra = (
+                f"blocks={sum(len(s.blocks) for s in report.report.sections)} "
+                f"refs={len(report.report.sources)} "
+                f"invented_keys_flagged={len(unresolvable_flagged)}"
+            )
+            _log_stage("5 ASSEMBLY", assembly_extra)
+            _notify_stage(
+                5,
+                f"complete (structured): {len(sections)} section(s), "
+                f"{len(report.report.sources)} source(s)",
+            )
+            final_answer = ""
+            return _finish(final_answer)
 
         # (b) References resolved deterministically from the cited keys.
         # Invented citation keys (cited but absent from the registry) are
@@ -1187,24 +1300,6 @@ def deep_research(
             )
 
         # (c) Machine-side state for save_report / observability.
-        merged_pack = {
-            "query": user_query,
-            "route_used": infer_route_used(all_doc, all_web),
-            "summary": (
-                f"Deep research evidence: {len(all_doc)} doc chunk(s) and "
-                f"{len(all_web)} web result(s) across {len(packs)} sub-question(s)."
-            ),
-            "document_evidence": {
-                "query": user_query,
-                "summary": "Merged per-sub-question document evidence (deduped).",
-                "chunks": all_doc,
-            },
-            "web_evidence": {
-                "query": user_query,
-                "summary": "Merged per-sub-question web evidence (deduped).",
-                "results": all_web,
-            },
-        }
         state["sections"] = [
             {"id": sq_id, "heading": heading, "text": text}
             for sq_id, heading, text in sections
@@ -1212,30 +1307,6 @@ def deep_research(
         state["critic"] = critic
         state["verification"] = final_answer
         state["draft"] = final_answer
-        state["evidence_json"] = json.dumps(merged_pack)
-        if critic:
-            coverage = {
-                "high": "comprehensive",
-                "medium": "moderate",
-                "low": "thin",
-            }.get(critic.get("confidence_level"), "moderate")
-            state["verification_status"] = {
-                "confidence": critic.get("confidence_level", "medium"),
-                "coverage": coverage,
-                "gaps": [
-                    g
-                    for verdict in critic.get("per_section") or []
-                    if isinstance(verdict, dict)
-                    for g in (verdict.get("gaps") or [])
-                    if g and g.strip()
-                ],
-            }
-        else:
-            state["verification_status"] = {
-                "confidence": "medium",
-                "coverage": "moderate",
-                "gaps": [],
-            }
         assembly_extra = (
             f"chars={len(final_answer)} refs={len(references.splitlines()) if references else 0} "
             f"invented_keys_dropped={len(invented_keys)} "
