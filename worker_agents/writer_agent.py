@@ -1,6 +1,11 @@
 from .model_runner import run_model
 from typing import Optional
 from utils.config import get_config
+import json
+import re
+from datetime import datetime, timezone
+
+from models import Metadata, Report, Section
 
 """
 Writer Agent 
@@ -9,13 +14,181 @@ It used by the Orchestrator to write a report on the retrieved information
 from the retriever agent.
 Main role is to draft a clear, grounded response from the evidence it receives.
 """
+
+_CITATION_KEY_RE = re.compile(r"[DW]\d+")
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Extract a single JSON object from a model response (best-effort).
+
+    Strips ```json/``` code fences if the whole response is fenced, then
+    takes the substring from the first "{" to the last "}" and parses it.
+    Returns the parsed dict, or None on any error (soft-fail).
+    """
+    if not text:
+        return None
+    candidate = text.strip()
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, re.DOTALL)
+    if fence:
+        candidate = fence.group(1).strip()
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        obj = json.loads(candidate[start:end + 1])
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _slug(heading: str) -> str:
+    """Lowercase-hyphen slug: non-alphanumeric runs collapse to one '-'."""
+    return re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-")
+
+
+WRITE_SECTION_JSON_INSTRUCTIONS = """
+You are writing ONE section of a deep-research report. You will be given:
+- the overall user query (for context only — do not answer it directly),
+- the full report outline (for context: where this section sits and what the
+  other sections cover — do not duplicate their content),
+- THIS section's heading and its context (the sub-question and angle it must
+  answer),
+- the citation-keyed evidence assigned to this section: every item carries a
+  key like [D1] or [W2],
+- one-line summaries of the sections already written (for coherence: do not
+  repeat what they established).
+
+CONTRACT — all of these are mandatory:
+1. Write at least 300 words of substance: concrete facts, mechanisms,
+   comparisons, and examples grounded in the evidence for THIS section —
+   not filler.
+2. Cite every factual sentence with a key that is ACTUALLY PROVIDED in the
+   evidence for this section: every factual sentence is one containing a
+   claim, name, number, date, or specific finding. Density target for this
+   section: at least 4 citations per 100 words; reusing the same key in
+   multiple sentences is correct and expected. NEVER invent a key that is
+   not present in this section's evidence. Each key goes at the end of the
+   sentence it supports.
+3. Output EXACTLY ONE JSON object — no Markdown, no code fences, no
+   commentary. Shape: {"id": "<lowercase-hyphen slug of the section
+   heading>", "heading": "<the exact section heading provided in the input>",
+   "blocks": [...]}. The exact section heading provided in the input is:
+   {SECTION_HEADING} — use it verbatim as "heading" and its lowercase-hyphen
+   slug as "id".
+4. Block vocabulary (one line each):
+   paragraph {"type":"paragraph","spans":[{"text":"...","citations":["D1"]}]}
+   heading {"type":"heading","level":3,"text":"..."}
+   unordered_list/ordered_list {"type":"...","items":[{"text":"...","citations":[...]}]}
+   callout {"type":"callout","callout_type":"note|warning|info","spans":[...]}
+   comparison_table {"type":"comparison_table","caption":"...","columns":[...],"rows":[[...]]}
+   code_block {"type":"code_block","language":"...","text":"..."}
+   page_break {"type":"page_break"}
+   citation_note {"type":"citation_note","spans":[...]}
+5. Per-sentence spans: split each paragraph into spans so the span that ends
+   a cited sentence carries that sentence's citation keys; uncited
+   transition spans get citations [].
+6. Use at least 2 blocks per section (a subsection heading is encouraged).
+
+Example of one paragraph block with per-sentence citation spans:
+{"type":"paragraph","spans":[{"text":"Grid-scale deployment rose sharply","citations":[]},{"text":"in several major electricity markets","citations":["D1","W2"]},{"text":"through 2024","citations":["D1"]}]}
+"""
+
+
+SYNTHESIS_JSON_INSTRUCTIONS = """
+You are writing the FINAL SYNTHESIS section of a deep-research report. You
+will be given the overall user query (context only) and the finished content
+sections of the report, each with its heading.
+
+CONTRACT — all of these are mandatory:
+1. Output EXACTLY ONE JSON object — no Markdown, no code fences, no
+   commentary. Shape: {"id": "synthesis", "heading": "Synthesis", "blocks":
+   [...]}. The heading MUST be exactly "Synthesis".
+2. Write 300-500 words that connect the report's sections: explicitly
+   compare or contrast the findings of at least 3 different sections BY
+   NAME (use their headings).
+3. If the sections contain tensions or contradictions, identify them
+   explicitly; if they do not, say so honestly.
+4. State 2-3 field-level implications that follow from the combined
+   findings of the report.
+5. Citations: you may use ONLY [D#]/[W#] keys that appear in the provided
+   section texts, and only at the end of the sentence they support — never
+   invent a key. A pure-synthesis sentence may have citations [].
+6. Do NOT introduce new factual claims not present in the provided
+   sections: you are connecting what is already there, not researching.
+7. Block vocabulary (one line each):
+   paragraph {"type":"paragraph","spans":[{"text":"...","citations":["D1"]}]}
+   heading {"type":"heading","level":3,"text":"..."}
+   unordered_list/ordered_list {"type":"...","items":[{"text":"...","citations":[...]}]}
+   callout {"type":"callout","callout_type":"note|warning|info","spans":[...]}
+   comparison_table {"type":"comparison_table","caption":"...","columns":[...],"rows":[[...]]}
+   code_block {"type":"code_block","language":"...","text":"..."}
+   page_break {"type":"page_break"}
+   citation_note {"type":"citation_note","spans":[...]}
+8. Per-sentence spans: split each paragraph into spans so the span that ends
+   a cited sentence carries that sentence's citation keys; uncited
+   transition spans get citations []. Use at least 2 blocks.
+"""
+
+
+WRITE_REPORT_JSON_INSTRUCTIONS = """
+Answer the user using only the evidence, as one structured JSON report.
+
+CONTRACT — all of these are mandatory:
+1. Output EXACTLY ONE JSON object — no Markdown, no code fences, no
+   commentary. Shape: {"title": "...", "subtitle": "", "executive_summary":
+   ["..."], "sections": [... 7-8 section objects ...]}.
+2. "title" describes the topic (not a copy of the query); "subtitle" may be
+   the empty string; "executive_summary" is a list of 2-4 self-contained
+   summary paragraphs.
+3. "sections" holds 7-8 section objects. Use this default set, adapting
+   section names to the topic when a better fit exists:
+   1. Definition & Background
+   2. Core Components & Mechanics
+   3. Major Variants & Alternative Approaches
+   4. Dynamics / Evaluation / Analysis
+   5. Applications
+   6. Tools & Ecosystem
+   7. Limitations & Open Problems
+   8. Synthesis
+   Each section object: {"id": "<lowercase-hyphen slug of its heading>",
+   "heading": "<the section heading>", "blocks": [...]} with at least 300
+   words of substance — concrete facts, mechanisms, comparisons, and
+   examples grounded in the evidence, not filler.
+4. Block vocabulary (one line each):
+   paragraph {"type":"paragraph","spans":[{"text":"...","citations":["D1"]}]}
+   heading {"type":"heading","level":3,"text":"..."}
+   unordered_list/ordered_list {"type":"...","items":[{"text":"...","citations":[...]}]}
+   callout {"type":"callout","callout_type":"note|warning|info","spans":[...]}
+   comparison_table {"type":"comparison_table","caption":"...","columns":[...],"rows":[[...]]}
+   code_block {"type":"code_block","language":"...","text":"..."}
+   page_break {"type":"page_break"}
+   citation_note {"type":"citation_note","spans":[...]}
+5. Per-sentence spans: split each paragraph into spans so the span that ends
+   a cited sentence carries that sentence's citation keys; uncited
+   transition spans get citations [].
+6. Cite every factual sentence with a key that is ACTUALLY PROVIDED in the
+   evidence. Density target: at least 4 citations per 100 words; reusing the
+   same key in multiple sentences is correct and expected. NEVER invent a
+   key that is not present in the evidence. Quantitative claims must always
+   carry a citation.
+7. Fully explain every concept (how it works, why, formulation, practical
+   implications); include mathematical formulas, architectural details,
+   quantitative comparisons, and specific examples from the evidence.
+8. When the evidence does not cover a fact you would need, write "the
+   available evidence does not cover X" — an honest gap. Never fill from
+   memory. If the evidence is weak or incomplete, say so.
+"""
+
+
 def writer_agent(
     user_query: str,
     evidence_text: str,
     verbose: bool = False,
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
-) -> str:
+    output_format: str = "markdown",
+) -> str | Report:
     """
     Execute the writer agent.
     
@@ -25,14 +198,20 @@ def writer_agent(
         verbose: Whether to print debug information
         endpoint: Optional custom endpoint URL
         api_key: Optional custom API key
+        output_format: "markdown" (default, unchanged) or "json" — JSON mode
+            asks for one structured JSON report object and returns a
+            validated models.Report (soft-fail: on any parse/validation
+            problem a minimal empty Report is returned, never raises).
         
     Returns:
         The written report as a string
+        (markdown mode) or a models.Report (json mode)
     """
+    output_format = "markdown" if output_format not in ("markdown", "json") else output_format
     if verbose:
         print("[Writer Agent] Writing report...")
 
-    instructions = (
+    markdown_instructions = (
         """
         Answer the user using only the evidence.
         Start with the answer.
@@ -69,6 +248,7 @@ def writer_agent(
         - Step 2: After the outline, write each section under its own "##" heading with at least 300 words of substance — concrete facts, mechanisms, comparisons, and examples grounded in the evidence, not filler.
         """
     )
+    instructions = WRITE_REPORT_JSON_INSTRUCTIONS if output_format == "json" else markdown_instructions
 
     # Pass the user query together with the retrieval context for drafting.
     input_text = (
@@ -87,7 +267,53 @@ def writer_agent(
         endpoint=endpoint,
         api_key=api_key,
     )
-    return response.output_text
+    if output_format != "json":
+        return response.output_text
+
+    obj = _extract_json_object(response.output_text or "")
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if obj is not None:
+        try:
+            title = str(obj.get("title") or "").strip() or (user_query[:100])
+            sections: list[Section] = []
+            for s in obj.get("sections", []):
+                if not isinstance(s, dict):
+                    continue
+                try:
+                    sections.append(Section.model_validate(s))
+                except Exception as exc:
+                    if verbose:
+                        print(f"[Writer Agent] WARNING: skipping invalid section: {exc}")
+            return Report(
+                metadata=Metadata(
+                    title=title,
+                    subtitle=str(obj.get("subtitle") or ""),
+                    query=user_query,
+                    session_id="",
+                    generated_at=generated_at,
+                    report_type="standard",
+                ),
+                executive_summary=[str(p) for p in obj.get("executive_summary", []) if str(p).strip()],
+                sections=sections,
+                sources=[],
+            )
+        except Exception as exc:
+            if verbose:
+                print(f"[Writer Agent] WARNING: report JSON validation failed ({exc}); returning empty report")
+    elif verbose:
+        print("[Writer Agent] WARNING: no JSON object in writer response; returning empty report")
+    return Report(
+        metadata=Metadata(
+            title=user_query[:100],
+            query=user_query,
+            session_id="",
+            generated_at=generated_at,
+            report_type="standard",
+        ),
+        executive_summary=[],
+        sections=[],
+        sources=[],
+    )
 
 
 """
@@ -154,7 +380,8 @@ def write_section(
     verbose: bool = False,
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
-) -> str:
+    output_format: str = "markdown",
+) -> str | Section:
     """
     Write ONE section of the deep-research report (P1-3).
 
@@ -174,14 +401,23 @@ def write_section(
         verbose: Print a one-line progress note.
         endpoint: Optional custom endpoint URL.
         api_key: Optional custom API key.
+        output_format: "markdown" (default, unchanged) or "json" — JSON mode
+            returns a validated models.Section (soft-fail: on any
+            parse/validation problem a minimal empty Section is returned,
+            never raises).
 
     Returns:
-        The section markdown starting with "## {section_heading}".
+        The section markdown starting with "## {section_heading}"
+        (markdown mode) or a models.Section (json mode)
     """
+    output_format = "markdown" if output_format not in ("markdown", "json") else output_format
     if verbose:
         print(f"[WRITER] Writing section: {section_heading}")
 
-    instructions = WRITE_SECTION_INSTRUCTIONS.replace("{SECTION_HEADING}", section_heading)
+    if output_format == "json":
+        instructions = WRITE_SECTION_JSON_INSTRUCTIONS.replace("{SECTION_HEADING}", section_heading)
+    else:
+        instructions = WRITE_SECTION_INSTRUCTIONS.replace("{SECTION_HEADING}", section_heading)
 
     parts = [
         f"Overall user query: {user_query}",
@@ -212,6 +448,22 @@ def write_section(
         api_key=api_key,
     )
     text = (response.output_text or "").strip()
+
+    if output_format == "json":
+        obj = _extract_json_object(text)
+        if obj is not None:
+            try:
+                section = Section.model_validate(obj)
+                if not section.heading:
+                    section.heading = section_heading
+                if not section.id:
+                    section.id = _slug(section_heading)
+                return section
+            except Exception:
+                pass
+        if verbose:
+            print(f"[WRITER] WARNING: section JSON validation failed for '{section_heading}'; returning empty section")
+        return Section(id=_slug(section_heading), heading=section_heading, blocks=[])
 
     # Defensive: the contract requires the section to start with its heading.
     if text and not text.startswith("## "):
@@ -259,7 +511,8 @@ def write_synthesis(
     verbose: bool = False,
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
-) -> str:
+    output_format: str = "markdown",
+) -> str | Section:
     """
     Write the final cross-section Synthesis section (P2-4a).
 
@@ -270,10 +523,16 @@ def write_synthesis(
         verbose: Print a one-line progress note.
         endpoint: Optional custom endpoint URL.
         api_key: Optional custom API key.
+        output_format: "markdown" (default, unchanged) or "json" — JSON mode
+            returns a validated models.Section (soft-fail: on any
+            parse/validation problem a minimal empty Section is returned,
+            never raises).
 
     Returns:
-        The synthesis markdown starting with "## Synthesis".
+        The synthesis markdown starting with "## Synthesis"
+        (markdown mode) or a models.Section (json mode)
     """
+    output_format = "markdown" if output_format not in ("markdown", "json") else output_format
     if verbose:
         print("[WRITER] Writing synthesis section")
 
@@ -286,9 +545,11 @@ def write_synthesis(
         f"already present in them):\n{section_blocks}"
     )
 
+    instructions = SYNTHESIS_JSON_INSTRUCTIONS if output_format == "json" else SYNTHESIS_INSTRUCTIONS
+
     config = get_config()
     response = run_model(
-        instructions=SYNTHESIS_INSTRUCTIONS,
+        instructions=instructions,
         input_data=input_text,
         reasoning_effort=config.get_reasoning_effort("writer"),
         max_output_tokens=config.get_max_output_tokens("writer"),
@@ -298,6 +559,22 @@ def write_synthesis(
         api_key=api_key,
     )
     text = (response.output_text or "").strip()
+
+    if output_format == "json":
+        obj = _extract_json_object(text)
+        if obj is not None:
+            try:
+                section = Section.model_validate(obj)
+                if not section.heading:
+                    section.heading = "Synthesis"
+                if not section.id:
+                    section.id = "synthesis"
+                return section
+            except Exception:
+                pass
+        if verbose:
+            print("[WRITER] WARNING: synthesis JSON validation failed; returning empty section")
+        return Section(id="synthesis", heading="Synthesis", blocks=[])
 
     # Defensive: the contract requires the section to start with its heading.
     if text and not text.startswith("## "):
