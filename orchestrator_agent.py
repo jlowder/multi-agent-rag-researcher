@@ -621,6 +621,7 @@ def orchestrator_agent(
                             user_query=state["user_query"],
                             evidence_text=formatted_evidence,
                             verbose=verbose,
+                            output_format="markdown",
                         )
                         state["written_draft"] = output
                         if verbose:

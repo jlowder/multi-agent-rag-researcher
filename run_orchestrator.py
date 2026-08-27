@@ -92,8 +92,21 @@ def chat_with_supervisor(
                 report_config, include_evidence_dump=True
             )
 
-        # Build and save enriched markdown report with evidence from state
-        if answer:
+        # Build and save the report. Deep mode saves the canonical
+        # structured document (JSON + sources + Markdown side export) when
+        # the pipeline produced one (state['report_json']); everything else
+        # keeps the legacy markdown path.
+        if mode == "deep" and save_state.get("report_json"):
+            from memory.save_report import save_structured_report
+            from models.report_schema import ResearchReport
+
+            saved_path = save_structured_report(
+                ResearchReport.model_validate_json(save_state["report_json"]),
+                state=save_state,
+                config=save_config,
+            )
+            print(f"Report saved to: {saved_path}")
+        elif answer:
             # Pass the full orchestration state to save_report for enriched reporting
             saved_path = save_report(
                 content=answer,

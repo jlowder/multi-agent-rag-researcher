@@ -387,3 +387,78 @@ def format_references(registry: dict, cited_keys: list) -> str:
             prefix = f"{title}. " if title else ""
             lines.append(f"[{number}] {prefix}{url_part}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Registry -> Sources mapping (plan §8.1): CSL-JSON-compatible source records
+# ---------------------------------------------------------------------------
+
+
+def registry_to_sources(registry: dict, cited_keys: list, include_uncited: bool = False) -> list[dict]:
+    """Convert the citation registry into CSL-JSON compatible source records.
+
+    Only keys present in `cited_keys` are included unless `include_uncited`
+    is True. Multiple registry entries from the same document are deduplicated
+    into one source record (doc: same document_name or title; web: same url);
+    the record keeps the primary (lowest-numbered) citation_key. Missing
+    bibliographic fields come out empty ("" / [] / {}), never null.
+
+    Returns list of dicts suitable for Source.model_validate (plan §8.1).
+    """
+    registry = registry or {}
+    if include_uncited:
+        keys: list[str] = list(registry.keys())
+    else:
+        seen: set[str] = set()
+        keys = []
+        for key in cited_keys or []:
+            if key in seen or key not in registry:
+                continue
+            seen.add(key)
+            keys.append(key)
+
+    records: list[dict] = []
+    dedupe_index: dict[tuple, int] = {}
+    for key in keys:
+        entry = registry.get(key) or {}
+        if entry.get("kind") == "doc":
+            dedupe_key = (
+                "doc",
+                (entry.get("document_name") or entry.get("title") or "").strip().lower(),
+            )
+            url = ""
+            source_type = "report"
+            issued: dict = {}
+        else:
+            dedupe_key = (
+                "web",
+                (entry.get("url") or "").strip().lower()
+                or (entry.get("title") or "").strip().lower(),
+            )
+            url = (entry.get("url") or "").strip()
+            source_type = "webpage"
+            issued = {}
+            published = entry.get("published_date")
+            if isinstance(published, str) and published.strip():
+                year = re.search(r"(\d{4})", published)
+                if year:
+                    issued = {"date-parts": [[int(year.group(1))]]}
+
+        if dedupe_key in dedupe_index:
+            continue  # same source already recorded under an earlier (primary) key
+        dedupe_index[dedupe_key] = len(records)
+        records.append(
+            {
+                "id": f"source-{key.lower()}",
+                "type": source_type,
+                "title": (entry.get("title") or "").strip(),
+                "author": [],
+                "issued": issued,
+                "URL": url,
+                "publisher": "",
+                "DOI": "",
+                "citation_key": key,
+                "accessed": "",
+            }
+        )
+    return records

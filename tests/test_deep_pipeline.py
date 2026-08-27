@@ -267,7 +267,7 @@ def test_pipeline_global_keys_across_merged_packs_and_re_retrieve(monkeypatch, c
         return "## Revised [W4]."
 
     env["writer_text"] = writer_text
-    result = _run(monkeypatch, env)
+    result = _run(monkeypatch, env, output_format="markdown")
 
     registry = result["state"]["citation_registry"]
     web_map = result["state"]["web_key_map"]
@@ -298,7 +298,7 @@ def test_references_first_appearance_order(monkeypatch):
             return "## Section One body: [W2] first, then [W1] second."
         return "## Section Two body citing [W3]."
 
-    result = _run(monkeypatch, _basic_env(writer_text=writer_text))
+    result = _run(monkeypatch, _basic_env(writer_text=writer_text), output_format="markdown")
     final = result["final_answer"]
 
     refs = final.split("## References", 1)[1]
@@ -404,7 +404,7 @@ def test_pipeline_renumbers_whole_body_including_exec_summary(monkeypatch):
             )
         return "## Section Two body citing [W3]."
 
-    result = _run(monkeypatch, _basic_env(writer_text=writer_text))
+    result = _run(monkeypatch, _basic_env(writer_text=writer_text), output_format="markdown")
     final = result["final_answer"]
     body_only = final.split("## References", 1)[0]
     # No internal key survives anywhere in the final answer...
@@ -502,7 +502,7 @@ def test_writer_revision_path_called_with_expansion_gaps(monkeypatch):
     writer_calls = _install_stubs(
         monkeypatch, _basic_env(critic_text=critic)
     )
-    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3, output_format="markdown")
 
     # 2 drafts + exactly 1 revision (only sq1 was flagged with gaps).
     assert len(writer_calls) == 3
@@ -533,7 +533,7 @@ def test_critic_garbage_falls_back_to_neutral_no_revisions(monkeypatch):
     writer_calls = _install_stubs(
         monkeypatch, _basic_env(critic_text="This is not JSON at all ###")
     )
-    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3, output_format="markdown")
 
     assert result["state"]["critic"]["source"] == "fallback"
     assert result["stats"]["revisions"] == 0
@@ -560,7 +560,7 @@ def test_budget_exhaustion_stops_and_assembles(monkeypatch, capsys):
     monkeypatch.setattr(dpo, "MAX_LLM_CALLS", 5)
     # Cost model: decomposer(1) + sufficiency x2 (2,3) + 2 section drafts
     # (4,5) → exhausted before the critic and the executive summary.
-    result = _run(monkeypatch, _basic_env())
+    result = _run(monkeypatch, _basic_env(), output_format="markdown")
 
     assert result["stats"]["llm_calls"] == 5
     assert result["stats"]["revisions"] == 0
@@ -589,7 +589,7 @@ def test_pipeline_survives_section_writer_failure(monkeypatch, capsys):
             raise RuntimeError("simulated 500 from the LLM server")
         return "## Section Two body citing [W3]."
 
-    result = _run(monkeypatch, _basic_env(writer_text=writer_text))
+    result = _run(monkeypatch, _basic_env(writer_text=writer_text), output_format="markdown")
 
     final = result["final_answer"]
     assert "## Section One" in final
@@ -616,7 +616,7 @@ def test_pipeline_survives_exec_summary_failure(monkeypatch, capsys):
         return _FakeResponse(text="unreachable")
 
     monkeypatch.setattr(dpo, "run_model", exec_stub)
-    result = dpo.deep_research("test research query", verbose=False, max_rounds=3)
+    result = dpo.deep_research("test research query", verbose=False, max_rounds=3, output_format="markdown")
 
     final = result["final_answer"]
     assert "## Executive Summary" not in final
@@ -742,7 +742,7 @@ def test_synthesis_appended_last_and_keys_resolve(monkeypatch):
             "chunks": [_doc("c1", "a.pdf", 0.9), _doc("c2", "b.pdf", 0.8)],
         },
     )
-    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3, output_format="markdown")
 
     assert len(_synth_calls(writer_calls)) == 1
     assert result["stats"]["synthesis_words"] > 0
@@ -805,7 +805,7 @@ def test_synthesis_failure_leaves_report_intact(monkeypatch):
     env = _basic_env(writer_text=writer_text)
     env["plan_json"] = PLAN_JSON_3SQ
     _install_stubs(monkeypatch, env)
-    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3, output_format="markdown")
 
     assert result["stats"]["synthesis_failed"] is True
     assert "## Synthesis" not in result["final_answer"]
@@ -828,7 +828,7 @@ def test_synthesis_skipped_when_too_few_sections(monkeypatch):
 def test_citation_density_state_is_deterministic(monkeypatch):
     # T5: state["citation_density"] = {overall, per_section}; overall
     # matches an independent recomputation on the final body.
-    result = _run(monkeypatch, _basic_env())
+    result = _run(monkeypatch, _basic_env(), output_format="markdown")
     cd = result["state"]["citation_density"]
     assert set(cd) == {"overall", "per_section"}
     assert cd["per_section"].keys() == {"Section One", "Section Two"}
@@ -911,7 +911,7 @@ def test_critic_low_citation_density_triggers_revision(monkeypatch):
     writer_calls = _install_stubs(
         monkeypatch, _basic_env(critic_text=critic)
     )
-    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3, output_format="markdown")
 
     # 2 drafts + exactly 1 revision (only sq1 was flagged for density).
     assert len(writer_calls) == 3

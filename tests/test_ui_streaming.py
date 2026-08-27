@@ -26,6 +26,7 @@ def test_pipeline_progress_callbacks_record_stages_and_sections(monkeypatch):
     result = dpo.deep_research(
         "test research query",
         verbose=False,
+        output_format="markdown",
         on_stage=lambda s, d: stages.append((s, d)),
         on_section=lambda i, t, h, txt, p: sections.append((i, t, h, txt, p)),
     )
@@ -62,7 +63,8 @@ def test_raising_callbacks_do_not_fail_the_run(monkeypatch, capsys):
     def bad_section(i, t, h, txt, p):
         raise RuntimeError("section callback boom")
 
-    result = _run(monkeypatch, _basic_env(), on_stage=bad_stage, on_section=bad_section)
+    result = _run(monkeypatch, _basic_env(), on_stage=bad_stage, on_section=bad_section,
+                  output_format="markdown")
 
     # A bad callback must never kill the run (P1 never-crash contract).
     assert "## Section One" in result["final_answer"]
