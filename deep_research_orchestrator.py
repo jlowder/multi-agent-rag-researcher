@@ -26,6 +26,7 @@ Standard mode (orchestrator_agent) is NOT modified.
 import importlib
 import json
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -51,11 +52,16 @@ from worker_agents.decomposition_agent import decompose_query
 from worker_agents.model_runner import run_model
 from worker_agents.retriever_agent import retriever_agent
 from worker_agents.verifier_agent import verification_critic
-from worker_agents.writer_agent import write_section, write_synthesis
+from worker_agents.writer_agent import (
+    reset_writer_retry_budget,
+    write_section,
+    write_synthesis,
+)
 from utils.config import get_config
 from deep_research_structured import (
     EXEC_SUMMARY_JSON_INSTRUCTIONS,
     assemble_structured_report,
+    _content_word_count,
     parse_exec_summary,
     sections_plain_text,
 )
@@ -103,13 +109,28 @@ class _LLMBudget:
             print(f"[DEEP] LLM call {self.count}/{self.limit} ({label})")
 
 
+# Per-symbol stacks of previously bound run_model implementations. The
+# install/restore pair must be re-entrancy safe: an install pushes the
+# CURRENTLY-BOUND function (whatever it is) onto the symbol's stack, and a
+# restore pops it and rebinds the new top — so overlapping deep runs unwind
+# in exactly the order they nested, never leaving a stale wrapper bound.
+_run_model_stacks: Dict[Any, list] = {}
+
+# Deep runs are long; serializing them is the safe net for the process-wide
+# run_model swap below (two overlapping runs would otherwise cross-charge
+# each other's budgets, and a late restore would poison standard-mode calls).
+_deep_run_lock = threading.Lock()
+
+
 def _install_tracked_run_models(budget: _LLMBudget, verbose: bool) -> list:
     """Swap each agent module's run_model with a budget-charging wrapper.
 
     The agents call `run_model` via their own module globals, so the swap
-    must happen per module. Returns (module, original) pairs for restore.
+    must happen per module. Each previously bound function is pushed onto
+    its symbol's stack (see _run_model_stacks). Returns (module, saved)
+    pairs for _restore_tracked_run_models.
     """
-    originals = []
+    saved = []
     for module, label in (
         (_decomposition_mod, "decomposer"),
         (_retriever_mod, "sufficiency/retriever"),
@@ -117,6 +138,8 @@ def _install_tracked_run_models(budget: _LLMBudget, verbose: bool) -> list:
         (_verifier_mod, "critic"),
     ):
         original = module.run_model
+        _run_model_stacks.setdefault(module, []).append(original)
+        saved.append((module, original))
 
         def make_wrapper(original, label):
             def wrapper(*args, **kwargs):
@@ -126,13 +149,19 @@ def _install_tracked_run_models(budget: _LLMBudget, verbose: bool) -> list:
             return wrapper
 
         module.run_model = make_wrapper(original, label)
-        originals.append((module, original))
-    return originals
+    return saved
 
 
 def _restore_tracked_run_models(originals: list) -> None:
-    for module, original in originals:
-        module.run_model = original
+    for module, original in reversed(originals):
+        stack = _run_model_stacks.get(module, [])
+        if stack and stack[-1] is original:
+            stack.pop()
+            module.run_model = stack[-1] if stack else original
+        else:
+            # Defensive (should not happen under _deep_run_lock): rebind
+            # exactly what was bound before this install.
+            module.run_model = original
 
 
 def _read_doc_catalog() -> List[Dict[str, str]]:
@@ -619,6 +648,12 @@ def deep_research(
         stats["sections"] = len(sections)
         return {"final_answer": final_answer, "state": state, "stats": stats}
 
+    # Serialize deep runs (the tracked run_model swap is process-global).
+    _deep_run_lock.acquire()
+    # AFTER the lock: a queued run must not re-arm the writer's shared
+    # truncation-retry budget while run 1 is still writing (reset would be
+    # an out-of-band write into a run that is in progress).
+    reset_writer_retry_budget()  # fresh truncation-retry budget for this run
     originals = _install_tracked_run_models(budget, verbose)
     try:
         # ------------------------------------------------------------------
@@ -857,7 +892,14 @@ def deep_research(
         # ------------------------------------------------------------------
         _notify_stage(4, "critic pass: checking every drafted section")
         if sections:
-            draft_text = "\n\n".join(_section_text_str(text) for _sid, _h, text in sections)
+            # Every section gets a "## heading (id: …)" boundary even when
+            # its content is empty, so the critic can see (and verdict) each
+            # section — matches its "one section per ## heading, labeled
+            # with its id" contract.
+            draft_text = "\n\n".join(
+                f"## {heading} (id: {sid})\n\n{_section_text_str(text)}"
+                for sid, heading, text in sections
+            )
             section_ids = [sq_id for sq_id, _h, _t in sections]
             if budget.can_afford(1):
                 critic = verification_critic(
@@ -872,7 +914,8 @@ def deep_research(
             else:
                 print(
                     "[DEEP] WARNING: LLM budget exhausted before the critic; "
-                    "skipping verification and revisions."
+                    "skipping verification (deterministic revisions may still "
+                    "run if budget allows)."
                 )
 
             added_docs: List[dict] = []
@@ -930,27 +973,59 @@ def deep_research(
                     )
 
             # Revisions: weak sections go back to write_section with gaps.
-            if critic:
+            # Two deduped sources, at most ONE revision per section per
+            # pass: the critic's verdicts (failed flags + its gaps) and the
+            # deterministic must-revise set — a draft that is empty (a
+            # truncation soft-fail yields a heading-only Section) or too
+            # short is rewritten even when the critic is None or all-pass.
+            MUST_REVISE_GAP = (
+                "This section has no/little content. Write the full section "
+                "(~300-1100 words) from the provided evidence; do not restate "
+                "the title as a heading."
+            )
+            must_revise = {
+                sid
+                for sid, _h, text in sections
+                if (isinstance(text, str) and len(text.split()) < 300)
+                or (hasattr(text, "blocks") and not text.blocks)
+                or (
+                    hasattr(text, "blocks")
+                    and text.blocks
+                    and _content_word_count(text) < 300
+                )
+            }
+            revision_queue: List[tuple] = []
+            queued: set = set()
+            verdicts = (critic.get("per_section") or []) if critic else []
+            for verdict in verdicts:
+                if not isinstance(verdict, dict):
+                    continue
+                if (
+                    verdict.get("grounded", True)
+                    and verdict.get("depth_ok", True)
+                    and verdict.get("citation_density_ok", True)
+                ):
+                    continue
+                gaps = [g for g in (verdict.get("gaps") or []) if g and g.strip()]
+                if not gaps:
+                    continue
+                sid = str(verdict.get("section_id") or "").strip()
+                index = next(
+                    (i for i, (s, _h, _t) in enumerate(sections) if s == sid),
+                    None,
+                )
+                if index is None or sid in queued:
+                    continue
+                revision_queue.append((index, sid, gaps))
+                queued.add(sid)
+            for index, (sid, _h, _t) in enumerate(sections):
+                if sid in must_revise and sid not in queued:
+                    revision_queue.append((index, sid, [MUST_REVISE_GAP]))
+                    queued.add(sid)
+
+            if revision_queue:
                 rev_counts: Dict[str, int] = {}
-                for verdict in critic.get("per_section") or []:
-                    if not isinstance(verdict, dict):
-                        continue
-                    if (
-                        verdict.get("grounded", True)
-                        and verdict.get("depth_ok", True)
-                        and verdict.get("citation_density_ok", True)
-                    ):
-                        continue
-                    gaps = [g for g in (verdict.get("gaps") or []) if g and g.strip()]
-                    if not gaps:
-                        continue
-                    sid = str(verdict.get("section_id") or "").strip()
-                    index = next(
-                        (i for i, (s, _h, _t) in enumerate(sections) if s == sid),
-                        None,
-                    )
-                    if index is None:
-                        continue
+                for index, sid, gaps in revision_queue:
                     if (
                         stats["revisions"] >= _MAX_EXPANSION_CALLS
                         or rev_counts.get(sid, 0) >= _MAX_REVISIONS_PER_SECTION
@@ -1326,3 +1401,4 @@ def deep_research(
         return _finish(final_answer)
     finally:
         _restore_tracked_run_models(originals)
+        _deep_run_lock.release()

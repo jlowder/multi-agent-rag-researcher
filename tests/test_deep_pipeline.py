@@ -162,7 +162,16 @@ def _install_stubs(monkeypatch, env: dict) -> dict:
 
     def writer_stub(*a, **k):
         writer_calls.append(k)
-        return _FakeResponse(text=env["writer_text"](len(writer_calls) - 1, k))
+        text = env["writer_text"](len(writer_calls) - 1, k)
+        # The writer contract requires ~300+ words of substance; pad the
+        # canned stubs up to that floor so the deterministic must-revise
+        # (empty / <300-word section) does not fire in tests that are not
+        # about it. (env may opt out with "pad_writer": False.)
+        if env.get("pad_writer", True) and len(text.split()) < 300:
+            text = text + " " + " ".join(
+                f"token{i}" for i in range(320 - len(text.split()))
+            )
+        return _FakeResponse(text=text)
 
     monkeypatch.setattr(dmod, "run_model", lambda *a, **k: _FakeResponse(text=env["plan_json"]))
     monkeypatch.setattr(rmod, "run_model", lambda *a, **k: _FakeResponse(text=env["sufficiency_json"]))
@@ -191,6 +200,32 @@ def _basic_env(critic_text: str = CRITIC_OK_JSON, writer_text=None) -> dict:
         "web_results": _default_web_results,
         "exec_text": "Synthesized executive summary prose.",
     }
+
+
+def _json_writer(i: int) -> str:
+    """Contract-compliant JSON section for json-mode pipeline tests: a
+    valid Section with 300+ words, so the deterministic must-revise
+    backstop (which rewrites empty / <300-word sections) stays silent."""
+    return json.dumps(
+        {
+            "id": f"section-{i + 1}",
+            "heading": f"Section {i + 1}",
+            "blocks": [
+                {
+                    "type": "paragraph",
+                    "spans": [
+                        {
+                            "text": "Body for section "
+                            + str(i + 1)
+                            + ". "
+                            + " ".join(f"word{j}" for j in range(310)),
+                            "citations": [],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
 
 
 def _run(monkeypatch, env, **kw) -> dict:
@@ -446,8 +481,12 @@ def test_decompose_fallback_retries_once_and_keeps_bigger_plan(monkeypatch, caps
             return _FakeResponse(text="total garbage, no JSON in sight")
         return _FakeResponse(text=PLAN_JSON)
 
+    env = _basic_env()
+    # json-mode run: the markdown stubs would soft-fail to empty Sections,
+    # which the must-revise backstop would then rewrite (changing call counts).
+    env["writer_text"] = lambda i, k: _json_writer(i)
     result = _run_with_decompose_stub(
-        monkeypatch, _basic_env(), decompose_stub, verbose=True
+        monkeypatch, env, decompose_stub, verbose=True
     )
     out = capsys.readouterr().out
 
@@ -774,7 +813,7 @@ def test_synthesis_skipped_on_budget_exec_summary_still_writes(monkeypatch):
     # 3 drafts + critic); limit 9 leaves exactly 1 call → synthesis (needs
     # 2: itself + exec summary) is skipped, exec summary still writes.
     def writer_text(i, k):
-        return f"## Section {i + 1} body [W1]."
+        return _json_writer(i)
 
     env = _basic_env(writer_text=writer_text)
     env["plan_json"] = PLAN_JSON_3SQ
@@ -816,7 +855,9 @@ def test_synthesis_failure_leaves_report_intact(monkeypatch):
 
 def test_synthesis_skipped_when_too_few_sections(monkeypatch):
     # T4: default plan = 2 sub-questions → synthesis never called.
-    writer_calls = _install_stubs(monkeypatch, _basic_env())
+    env = _basic_env()
+    env["writer_text"] = lambda i, k: _json_writer(i)
+    writer_calls = _install_stubs(monkeypatch, env)
     result = dpo.deep_research("test query", verbose=False, max_rounds=3)
 
     assert not _synth_calls(writer_calls)
@@ -923,3 +964,156 @@ def test_critic_low_citation_density_triggers_revision(monkeypatch):
     by_id = {e["section_id"]: e for e in result["state"]["critic"]["per_section"]}
     assert by_id["sq1"]["citation_density_ok"] is False
     assert by_id["sq2"]["citation_density_ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Deterministic must-revise + critic draft boundaries (stage 4)
+# ---------------------------------------------------------------------------
+
+
+def test_must_revise_empty_section_even_when_critic_all_pass(monkeypatch):
+    # One stage-3 draft soft-fails to an EMPTY Section (json mode); the
+    # critic says everything is fine. The deterministic must-revise pass
+    # must still rewrite the empty section, and the revision ships.
+    def writer_text(i, k):
+        if "REVISION REQUIRED" in (k.get("input_data") or ""):
+            return json.dumps(
+                {
+                    "id": "section-two",
+                    "heading": "Section Two",
+                    "blocks": [
+                        {
+                            "type": "paragraph",
+                            "spans": [
+                                {
+                                    "text": "Revised full body with substance. "
+                                    + " ".join(
+                                        f"fact{i}" for i in range(40)
+                                    ),
+                                    "citations": [],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+        if i == 1:
+            return "garbage, no JSON object here"
+        return _json_writer(i)
+
+    env = _basic_env(writer_text=writer_text)
+    env["pad_writer"] = False
+    writer_calls = _install_stubs(monkeypatch, env)
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+
+    assert result["stats"]["revisions"] == 1
+    revision = [c for c in writer_calls if "REVISION REQUIRED" in (c.get("input_data") or "")]
+    assert len(revision) == 1
+    assert "Section Two" in revision[0]["input_data"]
+    # The must-revise output is what ships.
+    assert "Revised full body with substance." in result["final_answer"]
+
+
+def test_critic_draft_shows_boundary_for_empty_section(monkeypatch):
+    # The critic's draft text carries a "## heading (id: sid)" boundary per
+    # section — including for a section whose draft is empty.
+    critic_inputs = []
+
+    def writer_text(i, k):
+        if i == 1:
+            return "garbage, no JSON object here"
+        return _json_writer(i)
+
+    env = _basic_env(writer_text=writer_text)
+    env["pad_writer"] = False
+    _install_stubs(monkeypatch, env)
+    monkeypatch.setattr(
+        vmod,
+        "run_model",
+        lambda *a, **k: (critic_inputs.append(k), _FakeResponse(text=CRITIC_OK_JSON))[1],
+    )
+    dpo.deep_research("test query", verbose=False, max_rounds=3)
+
+    assert critic_inputs, "critic was never called"
+    draft = critic_inputs[0].get("input_data") or ""
+    assert "## Section One (id: sq1)" in draft
+    assert "## Section Two (id: sq2)" in draft
+
+
+def test_tracked_run_model_stack_reentrant():
+    # Two install/restore cycles (as nested deep runs would under the lock)
+    # must unwind back to each agent module's original run_model, with no
+    # stack residue.
+    agents = (dmod, rmod, wmod, vmod)
+    originals = {id(m): m.run_model for m in agents}
+    s1 = dpo._install_tracked_run_models(dpo._LLMBudget(40), False)
+    try:
+        s2 = dpo._install_tracked_run_models(dpo._LLMBudget(40), False)
+        assert all(m.run_model is not originals[id(m)] for m in agents)
+        dpo._restore_tracked_run_models(s2)  # inner run unwinds first
+    finally:
+        dpo._restore_tracked_run_models(s1)
+    for m in agents:
+        assert m.run_model is originals[id(m)]
+        assert not dpo._run_model_stacks.get(m)
+    # A second sequential cycle also ends clean.
+    s3 = dpo._install_tracked_run_models(dpo._LLMBudget(40), False)
+    dpo._restore_tracked_run_models(s3)
+    for m in agents:
+        assert m.run_model is originals[id(m)]
+        assert not dpo._run_model_stacks.get(m)
+
+
+def test_must_revise_short_json_section_even_when_critic_all_pass(monkeypatch):
+    # A NON-empty but <300-word Section (json mode) must also be queued for
+    # must-revise: the 30-word ship-guard floor is not the writer contract.
+    def writer_text(i, k):
+        if "REVISION REQUIRED" in (k.get("input_data") or ""):
+            return json.dumps(
+                {
+                    "id": f"section-{i + 1}",
+                    "heading": f"Section {i + 1}",
+                    "blocks": [
+                        {
+                            "type": "paragraph",
+                            "spans": [
+                                {
+                                    "text": "Revised substantive draft. "
+                                    + " ".join(f"fact{j}" for j in range(320)),
+                                    "citations": [],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+        return json.dumps(
+            {
+                "id": f"section-{i + 1}",
+                "heading": f"Section {i + 1}",
+                "blocks": [
+                    {
+                        "type": "paragraph",
+                        "spans": [
+                            {
+                                "text": " ".join(f"word{j}" for j in range(100)),
+                                "citations": [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+    env = _basic_env(writer_text=writer_text)
+    env["pad_writer"] = False
+    writer_calls = _install_stubs(monkeypatch, env)
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+
+    # Both ~100-word sections were rewritten (~320-word revisions ship).
+    revisions = [
+        c for c in writer_calls if "REVISION REQUIRED" in (c.get("input_data") or "")
+    ]
+    assert len(revisions) == 2
+    assert result["stats"]["revisions"] == 2
+    assert "Revised substantive draft." in result["final_answer"]

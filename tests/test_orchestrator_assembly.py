@@ -105,6 +105,13 @@ def _para(text_cits) -> ReportBlock:
     )
 
 
+def _pad_span(n: int = 40):
+    """(text, citations) filler: pushes a stub section past the assemble
+    ship-guard's 30-word floor so tests of other behavior are unaffected.
+    Citations on the real spans above are what those tests exercise."""
+    return (" ".join(f"fact{i}" for i in range(n)), [])
+
+
 def _all_citations(rep: ResearchReport):
     return [
         c
@@ -176,8 +183,8 @@ class TestAssemble:
         )
 
     def test_renumber_first_appearance_order(self):
-        s1 = Section(id="s1", heading="One", blocks=[_para([("A.", ["W1", "D1"]), ("B.", [])])])
-        s2 = Section(id="s2", heading="Two", blocks=[_para([("C.", ["D2"]), ("D.", ["W1"])])])
+        s1 = Section(id="s1", heading="One", blocks=[_para([("A.", ["W1", "D1"]), ("B.", []), _pad_span()])])
+        s2 = Section(id="s2", heading="Two", blocks=[_para([("C.", ["D2"]), ("D.", ["W1"]), _pad_span()])])
         reg = {"D1": dict(DOC_A), "D2": dict(DOC_B), "W1": dict(WEB_A)}
         rep = self._assemble(s1, s2, registry=reg)
         assert _all_citations(rep) == ["1", "2", "3", "1"]
@@ -186,20 +193,27 @@ class TestAssemble:
         assert all(s.citation_key for s in rep.report.sources)
 
     def test_invented_key_dropped_and_flagged(self):
-        s1 = Section(id="s1", heading="One", blocks=[_para([("A.", ["W1"]), ("B.", ["D9"])])])
+        s1 = Section(id="s1", heading="One", blocks=[_para([("A.", ["W1"]), ("B.", ["D9"]), _pad_span()])])
         rep = self._assemble(s1, registry={"W1": dict(WEB_A)})
         assert _all_citations(rep) == ["1"]
         assert rep.quality.verification.get("unresolvable_citations") == ["D9"]
 
     def test_bare_numeric_out_of_range_dropped(self):
-        block = ReportBlock(type=BlockType.paragraph, text="Bare.", citations=["7", "W1"])
+        block = ReportBlock(
+            type=BlockType.paragraph,
+            # Filler words in the block text (the citation shorthand only
+            # merges into a span when the block has none) keep this section
+            # past the ship-guard's 30-word floor.
+            text="Bare. " + " ".join(f"fact{i}" for i in range(40)),
+            citations=["7", "W1"],
+        )
         s1 = Section(id="s1", heading="One", blocks=[block])
         rep = self._assemble(s1, registry={"W1": dict(WEB_A)})
         assert _all_citations(rep) == ["1"]
         assert "7" in rep.quality.verification.get("dropped_bare_citations", [])
 
     def test_quality_metrics(self):
-        s1 = Section(id="s1", heading="One", blocks=[_para([("A fact here.", ["W1"])])])
+        s1 = Section(id="s1", heading="One", blocks=[_para([("A fact here.", ["W1"]), _pad_span()])])
         rep = self._assemble(s1, registry={"W1": dict(WEB_A)})
         assert rep.report.metadata.title == "T"
         assert rep.report.executive_summary == ["Ex."]
@@ -209,12 +223,19 @@ class TestAssemble:
         assert isinstance(rep.quality.citation_density, dict)
 
     def test_empty_section_soft(self):
+        # Ship guard: an empty section ships with a gap-notice paragraph
+        # (heading preserved) plus a verification gap — never bare.
         rep = self._assemble(
             Section(id="s1", heading="Empty", blocks=[]), registry={}
         )
-        assert rep.report.sections[0].blocks == []
+        assert rep.report.sections[0].heading == "Empty"
+        notice = rep.report.sections[0].blocks[0]
+        assert notice.type == BlockType.paragraph
+        assert "no content was generated" in notice.spans[0].text
         assert rep.report.sources == []
-        assert rep.quality.total_words == 1  # the section heading counts
+        # 1 exec word + 19 gap-notice words (no blocks otherwise).
+        assert rep.quality.total_words == 20
+        assert rep.quality.verification["gaps"] == ["not_generated: Empty"]
         assert isinstance(rep.quality.citation_density, dict)
 
 
@@ -230,7 +251,9 @@ class TestParseExecSummary:
         ]
 
     def test_garbage_never_raises(self):
-        assert parse_exec_summary("{not json")  # list, no exception
+        # JSON-ish residue (starts with { or [) is stripped, not salvaged:
+        # an apology + raw JSON must not ship as the executive summary.
+        assert parse_exec_summary("{not json") == []
         assert parse_exec_summary("") == []
 
 
@@ -304,6 +327,13 @@ def _json_section(i):
                         "spans": [
                             {"text": "First fact.", "citations": ["W1"]},
                             {"text": "Doc fact.", "citations": ["D1"]},
+                            # Past the 300-word must-revise contract floor.
+                            {
+                                "text": " ".join(
+                                    f"fact{i}" for i in range(310)
+                                ),
+                                "citations": [],
+                            },
                         ],
                     }
                 ],
@@ -321,6 +351,13 @@ def _json_section(i):
                             {"text": "Second doc fact.", "citations": ["D2"]},
                             {"text": "Invented key fact.", "citations": ["D9"]},
                             {"text": "Back to web.", "citations": ["W1"]},
+                            # Past the 300-word must-revise contract floor.
+                            {
+                                "text": " ".join(
+                                    f"fact{i}" for i in range(310)
+                                ),
+                                "citations": [],
+                            },
                         ],
                     }
                 ],
@@ -459,3 +496,126 @@ def test_deep_research_json_mode_e2e(monkeypatch):
 
     # Writer JSON mode was actually used (two section calls, no synthesis).
     assert len(calls) == 2
+
+
+def test_assemble_guards_preserve_existing_gaps_and_drop_empty_synthesis():
+    # 5-word content section -> gap notice + "not_generated" gap appended
+    # AFTER the existing verification gaps; 500-word section untouched;
+    # empty synthesis dropped (degradation shape). render_markdown must run
+    # on the result.
+    short = Section(
+        id="s1",
+        heading="Short Area",
+        blocks=[_para([("Tiny bit.", []), ("More words.", []), ("Here.", []), ("Now.", []), ("Five.", [])])],
+    )
+    long = Section(
+        id="s2",
+        heading="Long Area",
+        blocks=[_para([(" ".join(f"word{i}" for i in range(500)), [])])],
+    )
+    empty_synth = Section(id="synthesis", heading="Synthesis", blocks=[])
+    rep = assemble_structured_report(
+        sections=[short, long, empty_synth],
+        registry={},
+        user_query="q",
+        session_id="s1",
+        exec_paragraphs=["Ex."],
+        verification_status={"gaps": ["existing gap"]},
+        title="T",
+    )
+    assert [s.heading for s in rep.report.sections] == ["Short Area", "Long Area"]
+    assert "no content was generated" in rep.report.sections[0].blocks[0].spans[0].text
+    assert rep.report.sections[1].blocks[0].spans[0].text.startswith("word0")
+    assert rep.quality.verification["gaps"] == [
+        "existing gap",
+        "not_generated: Short Area",
+    ]
+    from memory.save_report import render_markdown
+
+    md = render_markdown(rep)
+    assert "### Short Area" in md and "### Long Area" in md
+    assert "Synthesis" not in md
+
+
+class TestExecSummaryResidueRescue:
+    """F5: a small residue array must not dead-end the prose salvage path."""
+
+    def test_residue_array_yields_prose_rescue(self):
+        text = 'real prose para one.\nSecond para.\n["residue line"]'
+        paras = parse_exec_summary(text)
+        joined = " ".join(paras)
+        assert "residue" not in joined
+        assert "real prose para one." in joined and "Second para." in joined
+
+    def test_real_array_beats_earlier_residue(self):
+        text = (
+            '["residue line"]\n'
+            '["First real paragraph with substance.", "Second real paragraph."] '
+            'trailing'
+        )
+        assert parse_exec_summary(text) == [
+            "First real paragraph with substance.",
+            "Second real paragraph.",
+        ]
+
+
+def test_short_content_section_titled_synthesis_gets_gap_notice():
+    # A chemistry section HAPPENS to be titled "Synthesis" (id is not
+    # "synthesis") — it must get the gap notice, never a silent drop.
+    short = Section(
+        id="chemistry-of-synthesis",
+        heading="Synthesis",
+        blocks=[_para([("Tiny bit.", [])])],
+    )
+    body = Section(
+        id="body",
+        heading="Body",
+        blocks=[_para([(" ".join(f"w{i}" for i in range(400)), [])])],
+    )
+    rep = assemble_structured_report(
+        sections=[short, body],
+        registry={},
+        user_query="q",
+        session_id="s1",
+        exec_paragraphs=["Ex."],
+        verification_status={},
+        title="T",
+    )
+    assert [s.heading for s in rep.report.sections] == ["Synthesis", "Body"]
+    assert "no content was generated" in rep.report.sections[0].blocks[0].spans[0].text
+    assert rep.quality.verification["gaps"] == ["not_generated: Synthesis"]
+
+
+def test_short_section_with_synthesis_id_dropped():
+    # id "synthesis" is authoritative even when a content section holds it.
+    synth = Section(
+        id="synthesis",
+        heading="Synthesis",
+        blocks=[_para([("Tiny bit.", [])])],
+    )
+    body = Section(
+        id="body",
+        heading="Body",
+        blocks=[_para([(" ".join(f"w{i}" for i in range(400)), [])])],
+    )
+    rep = assemble_structured_report(
+        sections=[body, synth],
+        registry={},
+        user_query="q",
+        session_id="s1",
+        exec_paragraphs=["Ex."],
+        verification_status={},
+        title="T",
+    )
+    assert [s.heading for s in rep.report.sections] == ["Body"]
+
+
+def test_exec_summary_citation_lead_in_line_kept():
+    # F7: a line STARTING with a short citation token is prose, not JSON
+    # residue.
+    text = "[1] shows real finding.\n\nSecond para."
+    assert parse_exec_summary(text) == ["[1] shows real finding.", "Second para."]
+    # A multi-item array of prose is a summary; a lone short item is
+    # residue (the F5 single-item rule) and still falls to salvage.
+    assert parse_exec_summary('["one line", "two line"]') == ["one line", "two line"]
+    assert parse_exec_summary('["residue line"]') == []

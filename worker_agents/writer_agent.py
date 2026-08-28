@@ -1,11 +1,11 @@
 from .model_runner import run_model
-from typing import Optional
+from typing import Any, Optional
 from utils.config import get_config
 import json
 import re
 from datetime import datetime, timezone
 
-from models import Metadata, Report, Section
+from models import BlockType, Metadata, Report, ReportBlock, Section
 
 """
 Writer Agent 
@@ -17,34 +17,213 @@ Main role is to draft a clear, grounded response from the evidence it receives.
 
 _CITATION_KEY_RE = re.compile(r"[DW]\d+")
 
+_JSON_DECODER = json.JSONDecoder()
 
-def _extract_json_object(text: str) -> dict | None:
-    """Extract a single JSON object from a model response (best-effort).
+
+def _extract_json_object_span(text: str) -> tuple[dict | None, int]:
+    """Extract a single JSON object from a model response (best-effort),
+    returning (object, end-offset).
 
     Strips ```json/``` code fences if the whole response is fenced, then
-    takes the substring from the first "{" to the last "}" and parses it.
-    Returns the parsed dict, or None on any error (soft-fail).
+    tries to raw_decode a JSON value at EVERY "{" index and collects the
+    dicts that parse. (The old first-"{"→last-"}" slice silently returned
+    None when prose around the JSON contained braces, or when two objects
+    appeared.) When any parsed dict contains a "blocks" or "heading" key
+    the LARGEST such dict (by decoded span) is returned — a prose decoy
+    like `example: {"heading": "wrong"}` may precede the real section —
+    otherwise the first parsed dict. Returns (None, -1) when nothing
+    parses (soft-fail). The end offset is the position in the stripped
+    (de-fenced) text where the chosen object's decode ended, for
+    post-object premature-close recovery.
     """
     if not text:
-        return None
+        return None, -1
     candidate = text.strip()
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, re.DOTALL)
     if fence:
         candidate = fence.group(1).strip()
-    start = candidate.find("{")
-    end = candidate.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        obj = json.loads(candidate[start:end + 1])
-    except ValueError:
-        return None
-    return obj if isinstance(obj, dict) else None
+    parsed: list[tuple[dict, int, int]] = []
+    spans: list[tuple[int, int]] = []
+    for i, ch in enumerate(candidate):
+        if ch != "{":
+            continue
+        try:
+            obj, end = _JSON_DECODER.raw_decode(candidate, i)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        # Skip objects nested INSIDE an earlier-parsed object: when the
+        # response holds one top-level object, its inner dicts are parts of
+        # it, not competing objects (e.g. a report's section entries must
+        # not be preferred over the report itself).
+        if any(start <= i < e for start, e in spans):
+            continue
+        parsed.append((obj, i, end))
+        spans.append((i, end))
+    if not parsed:
+        return None, -1
+    # Prefer the LARGEST key-bearing dict (decoded span), not the first:
+    # a prose decoy like `example: {"heading": "wrong"}` may appear before
+    # the real section, and first-wins would let it steal the response.
+    keyed = [p for p in parsed if "blocks" in p[0] or "heading" in p[0]]
+    if keyed:
+        obj, _start, end = max(keyed, key=lambda p: p[2] - p[1])
+    else:
+        obj, _start, end = parsed[0]
+    return obj, end
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Extract a single JSON object from a model response (best-effort).
+    Same selection rules as _extract_json_object_span; returns the parsed
+    dict, or None when nothing parses (soft-fail)."""
+    return _extract_json_object_span(text)[0]
+
+
+_BLOCK_VOCAB = frozenset(t.value for t in BlockType)
+_MAX_RECOVERED_BLOCKS = 20
+
+
+def _recover_trailing_blocks(text: str, end: int) -> list[ReportBlock]:
+    """Premature-close recovery: some models close the section object early
+    and keep writing the remaining blocks as trailing JSON. Scan `text[end:]`
+    (raw_decode at every '{') and keep complete objects whose "type" is a
+    block-vocabulary value and which validate as ReportBlock (the lenient
+    string-cell coercion applies; invalids are skipped). Ignored entirely
+    when the remainder is insignificant (<200 non-ws chars and no '{').
+    Capped at _MAX_RECOVERED_BLOCKS blocks."""
+    if end < 0:
+        return []
+    remainder = text[end:]
+    if len(remainder.strip()) < 200 and "{" not in remainder:
+        return []
+    out: list[ReportBlock] = []
+    spans: list[tuple[int, int]] = []
+    for i, ch in enumerate(remainder):
+        if ch != "{" or len(out) >= _MAX_RECOVERED_BLOCKS:
+            continue
+        try:
+            obj, b_end = _JSON_DECODER.raw_decode(remainder, i)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") not in _BLOCK_VOCAB:
+            continue
+        if any(start <= i < e for start, e in spans):
+            continue
+        try:
+            out.append(ReportBlock.model_validate(obj))
+        except Exception:
+            continue
+        spans.append((i, b_end))
+    return out
+
+
+def _is_truncated_response(response) -> bool:
+    """True when the API signals the response was cut short by OUTPUT
+    LENGTH — the one case a 2x retry can help.
+
+    When incomplete_details is present it is authoritative: only
+    reason == "max_output_tokens" counts (a content_filter termination
+    will filter again at 2x — retrying is pointless). The bare
+    status == "incomplete" check is used only when details is missing.
+    Tolerates missing attributes.
+    """
+    details = getattr(response, "incomplete_details", None)
+    if details is not None:
+        reason = (
+            details.get("reason")
+            if isinstance(details, dict)
+            else getattr(details, "reason", None)
+        )
+        return reason == "max_output_tokens"
+    return getattr(response, "status", None) == "incomplete"
+
+
+def _looks_truncated_json(text: str) -> bool:
+    """Heuristic for a cut-off JSON object: after stripping one
+    full-response code fence, more "{" than "}" means the object never
+    closed."""
+    if not text:
+        return False
+    candidate = text.strip()
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, re.DOTALL)
+    if fence:
+        candidate = fence.group(1)
+    return candidate.count("{") > candidate.count("}")
+
+
+# Bounded per-run budget for truncated-draft retries: a truncated
+# section/synthesis draft gets ONE retry at 2x max_output_tokens, and the
+# budget keeps a chronically truncating model from eating the whole run's
+# LLM allowance. Reset at the start of each deep run (deep_research) and in
+# tests.
+_writer_retry_budget = 4
+
+
+def reset_writer_retry_budget(n: int = 4) -> None:
+    """Reset the per-run truncation-retry budget (call at run start)."""
+    global _writer_retry_budget
+    _writer_retry_budget = max(0, int(n))
+
+
+def _take_writer_retry() -> bool:
+    """Consume one retry if the budget allows; False when spent."""
+    global _writer_retry_budget
+    if _writer_retry_budget <= 0:
+        return False
+    _writer_retry_budget -= 1
+    return True
+
+
+_HEADING_ZERO_WIDTH = "\u200b\u200c\u200d\u2060\ufeff"
+
+
+def _normalize_heading(text: str) -> str:
+    """Tolerant heading comparison form: strip zero-width chars, collapse
+    whitespace, casefold, and drop trailing punctuation (:;.-—…)."""
+    s = "".join(ch for ch in (text or "") if ch not in _HEADING_ZERO_WIDTH)
+    s = " ".join(s.split()).casefold()
+    return s.rstrip(" \t.:;.-—…")
+
+
+def _strip_duplicate_heading(section: Section) -> None:
+    """Drop blocks[0] when it re-emits the section's own title (tolerant
+    match on the normalized text). Only the FIRST block is considered —
+    later subsection headings are never touched. Mutates section in place.
+    """
+    if not section.blocks:
+        return
+    first = section.blocks[0]
+    if first.type != "heading":
+        return
+    text = "".join(span.text for span in first.spans or []) or first.text
+    if _normalize_heading(text) and _normalize_heading(text) == _normalize_heading(section.heading):
+        section.blocks = section.blocks[1:]
 
 
 def _slug(heading: str) -> str:
     """Lowercase-hyphen slug: non-alphanumeric runs collapse to one '-'."""
     return re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-")
+
+
+def _salvage_blocks(blocks: Any) -> list[ReportBlock]:
+    """Keep only block entries that individually validate as ReportBlock
+    (salvage-on-validation-failure): a single malformed block (e.g. a
+    table whose cells a weak model wrote with the wrong shape) must not
+    sink the whole section. Non-list input yields []."""
+    if not isinstance(blocks, list):
+        return []
+    kept: list[ReportBlock] = []
+    for block in blocks:
+        if isinstance(block, ReportBlock):
+            kept.append(block)
+            continue
+        try:
+            kept.append(ReportBlock.model_validate(block))
+        except Exception:
+            continue
+    return kept
 
 
 WRITE_SECTION_JSON_INSTRUCTIONS = """
@@ -62,7 +241,8 @@ You are writing ONE section of a deep-research report. You will be given:
 CONTRACT — all of these are mandatory:
 1. Write at least 300 words of substance: concrete facts, mechanisms,
    comparisons, and examples grounded in the evidence for THIS section —
-   not filler.
+   not filler. Keep the section between about 300 and 1100 words of
+   substance.
 2. Cite every factual sentence with a key that is ACTUALLY PROVIDED in the
    evidence for this section: every factual sentence is one containing a
    claim, name, number, date, or specific finding. Density target for this
@@ -81,14 +261,18 @@ CONTRACT — all of these are mandatory:
    heading {"type":"heading","level":3,"text":"..."}
    unordered_list/ordered_list {"type":"...","items":[{"text":"...","citations":[...]}]}
    callout {"type":"callout","callout_type":"note|warning|info","spans":[...]}
-   comparison_table {"type":"comparison_table","caption":"...","columns":[...],"rows":[[...]]}
+   comparison_table {"type":"comparison_table","caption":"...","columns":["A","B"],"rows":[[{"text":"cell","citations":["D1"]},{"text":"cell2","citations":[]}]]}
    code_block {"type":"code_block","language":"...","text":"..."}
    page_break {"type":"page_break"}
    citation_note {"type":"citation_note","spans":[...]}
+   Table cells and list items must be span objects, never bare strings.
 5. Per-sentence spans: split each paragraph into spans so the span that ends
    a cited sentence carries that sentence's citation keys; uncited
    transition spans get citations [].
 6. Use at least 2 blocks per section (a subsection heading is encouraged).
+   Do NOT include the section's own title as a heading block — the title is
+   carried by the `heading` field. Include subsection heading blocks only
+   for subsections you actually write.
 
 Example of one paragraph block with per-sentence citation spans:
 {"type":"paragraph","spans":[{"text":"Grid-scale deployment rose sharply","citations":[]},{"text":"in several major electricity markets","citations":["D1","W2"]},{"text":"through 2024","citations":["D1"]}]}
@@ -121,10 +305,11 @@ CONTRACT — all of these are mandatory:
    heading {"type":"heading","level":3,"text":"..."}
    unordered_list/ordered_list {"type":"...","items":[{"text":"...","citations":[...]}]}
    callout {"type":"callout","callout_type":"note|warning|info","spans":[...]}
-   comparison_table {"type":"comparison_table","caption":"...","columns":[...],"rows":[[...]]}
+   comparison_table {"type":"comparison_table","caption":"...","columns":["A","B"],"rows":[[{"text":"cell","citations":["D1"]},{"text":"cell2","citations":[]}]]}
    code_block {"type":"code_block","language":"...","text":"..."}
    page_break {"type":"page_break"}
    citation_note {"type":"citation_note","spans":[...]}
+   Table cells and list items must be span objects, never bare strings.
 8. Per-sentence spans: split each paragraph into spans so the span that ends
    a cited sentence carries that sentence's citation keys; uncited
    transition spans get citations []. Use at least 2 blocks.
@@ -160,10 +345,11 @@ CONTRACT — all of these are mandatory:
    heading {"type":"heading","level":3,"text":"..."}
    unordered_list/ordered_list {"type":"...","items":[{"text":"...","citations":[...]}]}
    callout {"type":"callout","callout_type":"note|warning|info","spans":[...]}
-   comparison_table {"type":"comparison_table","caption":"...","columns":[...],"rows":[[...]]}
+   comparison_table {"type":"comparison_table","caption":"...","columns":["A","B"],"rows":[[{"text":"cell","citations":["D1"]},{"text":"cell2","citations":[]}]]}
    code_block {"type":"code_block","language":"...","text":"..."}
    page_break {"type":"page_break"}
    citation_note {"type":"citation_note","spans":[...]}
+   Table cells and list items must be span objects, never bare strings.
 5. Per-sentence spans: split each paragraph into spans so the span that ends
    a cited sentence carries that sentence's citation keys; uncited
    transition spans get citations [].
@@ -450,17 +636,81 @@ def write_section(
     text = (response.output_text or "").strip()
 
     if output_format == "json":
-        obj = _extract_json_object(text)
+        obj, obj_end = _extract_json_object_span(text)
+        if (
+            obj is None
+            and (_is_truncated_response(response) or _looks_truncated_json(text))
+            and _take_writer_retry()
+        ):
+            if verbose:
+                print(
+                    f"[WRITER] WARNING: '{section_heading}' output looks truncated; "
+                    "retrying at 2x max_output_tokens"
+                )
+            response = run_model(
+                instructions=instructions,
+                input_data=input_text,
+                reasoning_effort=config.get_reasoning_effort("writer"),
+                max_output_tokens=2 * config.get_max_output_tokens("writer"),
+                tools=None,
+                agent_name="writer",
+                endpoint=endpoint,
+                api_key=api_key,
+            )
+            text = (response.output_text or "").strip()
+            obj, obj_end = _extract_json_object_span(text)
         if obj is not None:
+            # Repair-before-validate: a single missing/None heading or id
+            # must not kill an otherwise complete section.
+            if isinstance(obj, dict):
+                obj["heading"] = obj.get("heading") or section_heading
+                obj["id"] = obj.get("id") or _slug(section_heading)
             try:
                 section = Section.model_validate(obj)
+            except Exception:
+                section = None
+            if section is None and isinstance(obj, dict):
+                salvaged = _salvage_blocks(obj.get("blocks"))
+                if salvaged:
+                    if verbose:
+                        print(
+                            f"[WRITER] WARNING: '{section_heading}' — kept "
+                            f"{len(salvaged)} of {len(obj.get('blocks') or [])} blocks "
+                            "after dropping invalid content"
+                        )
+                    try:
+                        section = Section(
+                            id=obj.get("id") or _slug(section_heading),
+                            heading=obj.get("heading") or section_heading,
+                            blocks=salvaged,
+                        )
+                    except Exception:
+                        # Wrong-typed heading/id (e.g. 123) would raise out
+                        # of the function; never-raise contract wins — fall
+                        # through to the soft-fail empty section below.
+                        section = None
+                        if verbose:
+                            print(
+                                f"[WRITER] WARNING: '{section_heading}' — "
+                                "salvage construction failed; returning empty section"
+                            )
+            if section is not None:
+                if obj_end >= 0:
+                    recovered = _recover_trailing_blocks(text, obj_end)
+                    if recovered:
+                        if verbose:
+                            print(
+                                f"[WRITER] WARNING: '{section_heading}' — "
+                                f"recovered {len(recovered)} block(s) written "
+                                "past the section object's premature close"
+                            )
+                        section.blocks.extend(recovered)
                 if not section.heading:
                     section.heading = section_heading
                 if not section.id:
                     section.id = _slug(section_heading)
+                _strip_duplicate_heading(section)
                 return section
-            except Exception:
-                pass
         if verbose:
             print(f"[WRITER] WARNING: section JSON validation failed for '{section_heading}'; returning empty section")
         return Section(id=_slug(section_heading), heading=section_heading, blocks=[])
@@ -561,17 +811,81 @@ def write_synthesis(
     text = (response.output_text or "").strip()
 
     if output_format == "json":
-        obj = _extract_json_object(text)
+        obj, obj_end = _extract_json_object_span(text)
+        if (
+            obj is None
+            and (_is_truncated_response(response) or _looks_truncated_json(text))
+            and _take_writer_retry()
+        ):
+            if verbose:
+                print(
+                    "[WRITER] WARNING: synthesis output looks truncated; "
+                    "retrying at 2x max_output_tokens"
+                )
+            response = run_model(
+                instructions=instructions,
+                input_data=input_text,
+                reasoning_effort=config.get_reasoning_effort("writer"),
+                max_output_tokens=2 * config.get_max_output_tokens("writer"),
+                tools=None,
+                agent_name="writer",
+                endpoint=endpoint,
+                api_key=api_key,
+            )
+            text = (response.output_text or "").strip()
+            obj, obj_end = _extract_json_object_span(text)
         if obj is not None:
+            # Repair-before-validate: a single missing/None heading or id
+            # must not kill an otherwise complete section.
+            if isinstance(obj, dict):
+                obj["heading"] = obj.get("heading") or "Synthesis"
+                obj["id"] = obj.get("id") or "synthesis"
             try:
                 section = Section.model_validate(obj)
+            except Exception:
+                section = None
+            if section is None and isinstance(obj, dict):
+                salvaged = _salvage_blocks(obj.get("blocks"))
+                if salvaged:
+                    if verbose:
+                        print(
+                            f"[WRITER] WARNING: 'Synthesis' — kept "
+                            f"{len(salvaged)} of {len(obj.get('blocks') or [])} blocks "
+                            "after dropping invalid content"
+                        )
+                    try:
+                        section = Section(
+                            id=obj.get("id") or "synthesis",
+                            heading=obj.get("heading") or "Synthesis",
+                            blocks=salvaged,
+                        )
+                    except Exception:
+                        # Wrong-typed heading/id (e.g. 123) would raise out
+                        # of the function; never-raise contract wins — fall
+                        # through to the soft-fail empty section below.
+                        section = None
+                        if verbose:
+                            print(
+                                "[WRITER] WARNING: 'Synthesis' — salvage "
+                                "construction failed; returning empty section"
+                            )
+            if section is not None:
+                if obj_end >= 0:
+                    recovered = _recover_trailing_blocks(text, obj_end)
+                    if recovered:
+                        if verbose:
+                            print(
+                                f"[WRITER] WARNING: 'Synthesis' — "
+                                f"recovered {len(recovered)} block(s) written "
+                                "past the section object's premature close"
+                            )
+                        section.blocks.extend(recovered)
                 if not section.heading:
                     section.heading = "Synthesis"
                 if not section.id:
                     section.id = "synthesis"
+                _strip_duplicate_heading(section)
                 return section
-            except Exception:
-                pass
         if verbose:
             print("[WRITER] WARNING: synthesis JSON validation failed; returning empty section")
         return Section(id="synthesis", heading="Synthesis", blocks=[])

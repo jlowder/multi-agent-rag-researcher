@@ -981,11 +981,35 @@ def is_valid_report_path(filepath: Union[str, Path]) -> bool:
 # =============================================================================
 
 
+_HEADING_ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\ufeff]")
+
+
+def _normalize_heading_text(value: str) -> str:
+    """Tolerant heading comparison form (mirror of the writer's, kept local
+    to avoid a dependency edge into worker_agents): remove zero-width
+    chars, casefold, collapse whitespace to single spaces, strip trailing
+    punctuation (\u2026 and :;.-—)."""
+    s = _HEADING_ZERO_WIDTH_RE.sub("", value or "")
+    s = " ".join(s.split()).casefold()
+    return s.rstrip(" \t.:;.-—…")
+
+
+def _collapse_ws(value: str) -> str:
+    """Collapse whitespace runs to single spaces. Span/cell text and
+    source labels can come from web content (attacker-controllable); an
+    embedded newline there would inject Markdown structure into the saved
+    report. Code-block text is intentionally NOT collapsed (literal)."""
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
 def _render_span(text: str, citations) -> str:
-    """Render one span: its text followed by [^n] footnote markers."""
-    out = text or ""
+    """Render one span: its text (whitespace collapsed, see _collapse_ws)
+    followed by [^n] footnote markers. Token text is collapsed too — a
+    newline inside a (legacy/hand-authored) citation token would otherwise
+    split the [^n]: footnote definition across lines."""
+    out = _collapse_ws(text)
     for c in citations or []:
-        out += f"[^{c}]"
+        out += f"[^{_collapse_ws(str(c))}]"
     return out
 
 
@@ -997,14 +1021,14 @@ def _render_block(block) -> List[str]:
         level = max(1, min(6, int(block.level or 3)))
         text = (
             "".join(_render_span(s.text, s.citations) for s in block.spans)
-            or block.text
+            or _collapse_ws(block.text)
         )
         lines.append("#" * level + " " + text.strip())
     elif btype == "paragraph":
         if block.spans:
             text = "".join(_render_span(s.text, s.citations) for s in block.spans)
         else:
-            text = block.text
+            text = _collapse_ws(block.text)
         lines.append(text.strip())
     elif btype in ("ordered_list", "unordered_list"):
         for i, item in enumerate(block.items or []):
@@ -1013,7 +1037,7 @@ def _render_block(block) -> List[str]:
     elif btype == "callout":
         body = (
             "".join(_render_span(s.text, s.citations) for s in block.spans)
-            or block.text
+            or _collapse_ws(block.text)
         )
         label = block.callout_title or block.callout_type.title()
         lines.append(f"> **{label}:** {body.strip()}")
@@ -1046,12 +1070,12 @@ def _render_block(block) -> List[str]:
     elif btype == "citation_note":
         body = (
             "".join(_render_span(s.text, s.citations) for s in block.spans)
-            or block.text
+            or _collapse_ws(block.text)
         )
         lines.append(f"> {body.strip()}")
     else:
         if block.text:
-            lines.append(block.text.strip())
+            lines.append(_collapse_ws(block.text))
     return [l for l in lines if l != ""]
 
 
@@ -1090,10 +1114,25 @@ def render_markdown(report) -> str:
             lines.append(str(para).strip())
             lines.append("")
 
+    section_headings = [_normalize_heading_text(s.heading) for s in report.sections]
     for section in report.sections:
         lines.append(f"### {section.heading}")
         lines.append("")
-        for block in section.blocks:
+        blocks = list(section.blocks or [])
+        # Skip a LEADING heading block whose text duplicates this section's
+        # own heading (or any sibling section's heading — a phantom
+        # boundary): the heading line above already prints it, so a block
+        # restating it would render the title twice. Only blocks[0] is
+        # considered; later subsection headings always render.
+        if blocks and blocks[0].type == "heading":
+            first_text = (
+                "".join(_render_span(s.text, s.citations) for s in blocks[0].spans)
+                or blocks[0].text
+            )
+            first_norm = _normalize_heading_text(first_text)
+            if first_norm and first_norm in section_headings:
+                blocks = blocks[1:]
+        for block in blocks:
             block_lines = _render_block(block)
             if block_lines:
                 lines.extend(block_lines)
@@ -1104,7 +1143,7 @@ def render_markdown(report) -> str:
         if lines and lines[-1] != "":
             lines.append("")
         for i, s in enumerate(sources, start=1):
-            label = (s.title or s.URL or s.id).strip()
+            label = _collapse_ws(s.title or s.URL or s.id)
             lines.append(f"[^{i}]: {label}")
         lines.append("")
 

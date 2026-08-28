@@ -138,6 +138,53 @@ def test_citations_shorthand_merges():
     assert block.spans == [Span(text="Some words here.", citations=["D1"])]
 
 
+def test_string_table_cells_coerced_to_spans():
+    # Weak models write comparison_table cells as bare strings; the schema
+    # must coerce them to uncited Spans instead of rejecting the block.
+    block = ReportBlock.model_validate(
+        {
+            "type": "comparison_table",
+            "caption": "c",
+            "columns": ["A", "B"],
+            "rows": [["x", "y"], ["z", "w"]],
+        }
+    )
+    assert block.rows[0][0].text == "x"
+    assert block.rows[0][0].citations == []
+    assert block.rows[1][1].text == "w"
+
+
+def test_string_list_items_and_spans_coerced():
+    block = ReportBlock.model_validate(
+        {"type": "unordered_list", "items": ["a", {"text": "b", "citations": ["D1"]}, "c"]}
+    )
+    assert [item.text for item in block.items] == ["a", "b", "c"]
+    assert block.items[1].citations == ["D1"]
+
+
+def test_section_with_string_table_cells_validates():
+    section = Section.model_validate(
+        {
+            "id": "s",
+            "heading": "S",
+            "blocks": [
+                {
+                    "type": "comparison_table",
+                    "caption": "c",
+                    "columns": ["A"],
+                    "rows": [["cell"]],
+                }
+            ],
+        }
+    )
+    assert section.blocks[0].rows[0][0].text == "cell"
+
+
+def test_invalid_block_type_still_rejected():
+    with pytest.raises(ValidationError):
+        ReportBlock.model_validate({"type": "nonsense"})
+
+
 def test_density_hand_computed():
     words = [f"w{i:02d}" for i in range(100)]
     spans = [

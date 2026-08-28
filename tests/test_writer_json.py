@@ -9,7 +9,10 @@ no LLM calls.
 """
 
 import importlib
+import json
 import re
+
+import pytest
 
 from models import (
     Metadata,
@@ -24,10 +27,31 @@ wmod = importlib.import_module("worker_agents.writer_agent")
 
 
 class _FakeResponse:
-    """Stand-in for the run_model response object (only output_text is used)."""
+    """Stand-in for the run_model response object (output_text plus the
+    optional truncation signals the writer checks)."""
 
-    def __init__(self, output_text: str):
+    def __init__(self, output_text: str, status=None, incomplete_details=None):
         self.output_text = output_text
+        self.status = status
+        self.incomplete_details = incomplete_details
+
+
+class _FakeConfig:
+    """Config stand-in with a small, known max_output_tokens for 2x asserts."""
+
+    def get_reasoning_effort(self, agent_name: str) -> str:
+        return "medium"
+
+    def get_max_output_tokens(self, agent_name: str) -> int:
+        return 1000
+
+
+@pytest.fixture(autouse=True)
+def _reset_writer_retry_budget():
+    # The truncation-retry budget is module-global; keep tests isolated.
+    wmod.reset_writer_retry_budget()
+    yield
+    wmod.reset_writer_retry_budget()
 
 
 def _patch_run_model(monkeypatch, text: str):
@@ -40,6 +64,33 @@ def _patch_run_model(monkeypatch, text: str):
 
     monkeypatch.setattr(wmod, "run_model", fake)
     return calls
+
+
+def _patch_run_model_seq(monkeypatch, responses: list):
+    """Patch wmod.run_model to return the given responses in order; record
+    kwargs per call. Use of a 2nd response is the retry under test."""
+    calls = []
+    it = iter(responses)
+
+    def fake(*args, **kwargs):
+        calls.append(kwargs)
+        return next(it)
+
+    monkeypatch.setattr(wmod, "run_model", fake)
+    return calls
+
+
+def _section_kwargs(**overrides) -> dict:
+    kwargs = dict(
+        user_query="Explain fusion energy",
+        outline="## Definition & Background\n## Synthesis",
+        section_heading="Market",
+        section_context="Cover market dynamics.",
+        evidence_text="[D1] Evidence line one.",
+        output_format="json",
+    )
+    kwargs.update(overrides)
+    return kwargs
 
 
 def _write_section(monkeypatch, text: str, **overrides):
@@ -294,3 +345,248 @@ def test_write_section_json_missing_id_gets_slug(monkeypatch):
     assert isinstance(section, Section)
     assert section.heading == "Market Landscape"
     assert section.id == "market-landscape"
+
+
+# ---------------------------------------------------------------------------
+# F. Truncation, retry budget, extraction repair, heading dedup
+# ---------------------------------------------------------------------------
+
+TRUNCATED_SECTION = (
+    '{"id": "market", "heading": "Market", "blocks": '
+    '[{"type": "paragraph", "spans": [{"text": "The deployment climbed'
+)
+
+
+def test_truncated_response_retries_at_2x_and_recovers(monkeypatch):
+    monkeypatch.setattr(wmod, "get_config", lambda: _FakeConfig())
+    calls = _patch_run_model_seq(
+        monkeypatch,
+        [
+            _FakeResponse(TRUNCATED_SECTION, status="incomplete"),
+            _FakeResponse(SECTION_JSON),
+        ],
+    )
+    section = wmod.write_section(**_section_kwargs())
+    assert len(calls) == 2
+    assert calls[0]["max_output_tokens"] == 1000
+    assert calls[1]["max_output_tokens"] == 2000
+    assert isinstance(section, Section)
+    assert section.blocks  # recovered draft, not the soft-fail empty section
+
+
+def test_truncated_response_budget_exhausted_no_retry(monkeypatch):
+    monkeypatch.setattr(wmod, "get_config", lambda: _FakeConfig())
+    wmod.reset_writer_retry_budget(0)
+    calls = _patch_run_model_seq(
+        monkeypatch, [_FakeResponse(TRUNCATED_SECTION, status="incomplete")]
+    )
+    section = wmod.write_section(**_section_kwargs())
+    assert len(calls) == 1  # no second call when the budget is spent
+    assert section.blocks == []  # soft-fail section
+    assert section.heading == "Market"
+    assert section.id == "market"
+
+
+def test_non_truncated_parse_failure_no_retry(monkeypatch):
+    monkeypatch.setattr(wmod, "get_config", lambda: _FakeConfig())
+    # Balanced braces, unparseable body: NOT a truncation signal, so no retry.
+    calls = _patch_run_model_seq(
+        monkeypatch, [_FakeResponse('{"a": } oops, balanced but broken')]
+    )
+    section = wmod.write_section(**_section_kwargs())
+    assert len(calls) == 1
+    assert section.blocks == []
+    assert section.heading == "Market"
+
+
+def test_extract_prose_with_braces_before_valid_object():
+    text = 'Intro with braces: {"x": 1} done. ' + SECTION_JSON
+    assert wmod._extract_json_object(text) == {
+        "id": "market",
+        "heading": "Market",
+        "blocks": [
+            {"type": "paragraph", "spans": [{"text": "Facts here.", "citations": ["D1"]}]}
+        ],
+    }
+
+
+def test_null_id_missing_heading_repaired_from_input(monkeypatch):
+    text = (
+        '{"id": null, "blocks": [{"type": "paragraph",'
+        ' "spans": [{"text": "Body.", "citations": []}]}]}'
+    )
+    section, _ = _write_section(
+        monkeypatch, text, section_heading="Deep Dive", output_format="json"
+    )
+    assert isinstance(section, Section)
+    assert section.heading == "Deep Dive"
+    assert section.id == "deep-dive"
+    assert len(section.blocks) == 1
+
+
+def test_duplicate_leading_heading_stripped_tolerant(monkeypatch):
+    # blocks[0] re-emits the section title in a case/whitespace variant.
+    text = (
+        '{"id": "market", "heading": "Market", "blocks": ['
+        '{"type": "heading", "level": 3, "text": "  market  "},'
+        '{"type": "paragraph", "spans": [{"text": "Body.", "citations": []}]}]}'
+    )
+    section, _ = _write_section(monkeypatch, text, output_format="json")
+    assert len(section.blocks) == 1
+    assert section.blocks[0].type == "paragraph"
+
+
+def test_different_first_subsection_heading_kept(monkeypatch):
+    text = (
+        '{"id": "market", "heading": "Market", "blocks": ['
+        '{"type": "heading", "level": 3, "text": "Sub Section"},'
+        '{"type": "paragraph", "spans": [{"text": "Body.", "citations": []}]}]}'
+    )
+    section, _ = _write_section(monkeypatch, text, output_format="json")
+    assert len(section.blocks) == 2
+    assert section.blocks[0].type == "heading"
+    assert section.blocks[0].text == "Sub Section"
+
+
+def test_extract_prefers_largest_keyed_dict_over_prose_decoy():
+    real = json.dumps(
+        {
+            "id": "market",
+            "heading": "Market",
+            "blocks": [
+                {"type": "paragraph", "spans": [{"text": "x" * 400, "citations": []}]}
+            ],
+        }
+    )
+    # A tiny decoy with a preferred key appears BEFORE the real section.
+    text = 'Here is an example: {"heading": "wrong"}\n' + real
+    assert wmod._extract_json_object(text) == json.loads(real)
+    # Array-wrapped decoy (its dict is nested, so not a competing object;
+    # the real section still wins on size).
+    text2 = 'note: [{"heading": "decoy"}]\n' + real
+    assert wmod._extract_json_object(text2) == json.loads(real)
+    # Two real candidates: the bigger one wins.
+    small = '{"id": "a", "heading": "A", "blocks": []}'
+    text3 = small + "\n" + real
+    assert wmod._extract_json_object(text3)["id"] == "market"
+
+
+def test_content_filter_termination_does_not_retry(monkeypatch):
+    # status="incomplete" with a NON-length reason (content_filter) must
+    # NOT trigger the 2x retry — the filter will fire again.
+    monkeypatch.setattr(wmod, "get_config", lambda: _FakeConfig())
+    # No braces at all: the brace-balance heuristic stays quiet, so only the
+    # response-status signal is under test here.
+    filtered = "the response was filtered by the safety policy"
+    calls = _patch_run_model_seq(
+        monkeypatch,
+        [
+            _FakeResponse(
+                filtered,
+                status="incomplete",
+                incomplete_details={"reason": "content_filter"},
+            )
+        ],
+    )
+    section = wmod.write_section(**_section_kwargs())
+    assert len(calls) == 1
+    assert section.blocks == []
+    assert section.heading == "Market"
+
+
+# ---------------------------------------------------------------------------
+# C1/C2/C3 robustness: lenient cells, whole-object salvage, premature-close
+# recovery
+# ---------------------------------------------------------------------------
+
+
+def test_string_cell_table_section_validates(monkeypatch):
+    # A whole-object table with bare-string cells must validate end-to-end
+    # (lenient coercion) and come back with proper spans.
+    table = {
+        "type": "comparison_table",
+        "caption": "c",
+        "columns": ["A", "B"],
+        "rows": [["x", "y"], ["z", "w"]],
+    }
+    text = json.dumps({"id": "market", "heading": "Market", "blocks": [table]})
+    section, _ = _write_section(monkeypatch, text)
+    assert section.heading == "Market"
+    assert len(section.blocks) == 1
+    assert section.blocks[0].rows[0][0].text == "x"
+    assert section.blocks[0].rows[0][0].citations == []
+    assert section.blocks[0].rows[1][1].text == "w"
+
+
+def test_salvage_keeps_valid_blocks_after_failed_validation(monkeypatch):
+    # The object contains one valid block and one block with a bad type:
+    # whole-object validation fails, but the good block must be salvaged
+    # instead of the whole section soft-failing to empty.
+    text = json.dumps(
+        {
+            "id": "market",
+            "heading": "Market",
+            "blocks": [
+                {
+                    "type": "paragraph",
+                    "spans": [{"text": "good paragraph words", "citations": ["D1"]}],
+                },
+                {"type": "nonsense"},
+            ],
+        }
+    )
+    section, _ = _write_section(monkeypatch, text)
+    assert section.heading == "Market"
+    assert len(section.blocks) == 1
+    assert section.blocks[0].type.value == "paragraph"
+    assert section.blocks[0].spans[0].text == "good paragraph words"
+
+
+def test_premature_close_recovers_trailing_blocks(monkeypatch):
+    # Model closed the section object after one block, then kept writing
+    # more block objects: all of them must survive.
+    para = {"type": "paragraph", "spans": [{"text": "first block text", "citations": ["D1"]}]}
+    heading = {"type": "heading", "level": 3, "text": "More"}
+    table = {"type": "comparison_table", "caption": "c", "columns": ["A"], "rows": [["cell"]]}
+    closed = json.dumps({"id": "market", "heading": "Market", "blocks": [para]})
+    text = closed + "," + json.dumps(heading) + "," + json.dumps(table)
+    section, _ = _write_section(monkeypatch, text)
+    assert [b.type.value for b in section.blocks] == [
+        "paragraph",
+        "heading",
+        "comparison_table",
+    ]
+    assert section.blocks[2].rows[0][0].text == "cell"
+
+
+def test_trailing_prose_is_ignored(monkeypatch):
+    # Trailing text with no valid block objects must not create blocks.
+    para = {"type": "paragraph", "spans": [{"text": "only block", "citations": ["D1"]}]}
+    closed = json.dumps({"id": "market", "heading": "Market", "blocks": [para]})
+    text = closed + " " + ("prose without braces here " * 30)
+    section, _ = _write_section(monkeypatch, text)
+    assert len(section.blocks) == 1
+    assert section.blocks[0].spans[0].text == "only block"
+
+
+def test_wrong_typed_id_soft_fails_instead_of_raising(monkeypatch):
+    # id is a truthy wrong-typed value (123): whole-object validation fails
+    # AND the salvage Section construction would raise; the never-raise
+    # contract requires falling through to the empty soft-fail section.
+    text = json.dumps(
+        {
+            "id": 123,
+            "heading": "Market",
+            "blocks": [
+                {
+                    "type": "paragraph",
+                    "spans": [{"text": "good words here", "citations": ["D1"]}],
+                },
+                {"type": "nonsense"},
+            ],
+        }
+    )
+    section, _ = _write_section(monkeypatch, text)
+    assert section.blocks == []
+    assert section.heading == "Market"
+    assert section.id == "market"
