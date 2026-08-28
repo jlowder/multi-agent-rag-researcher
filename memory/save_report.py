@@ -981,6 +981,19 @@ def is_valid_report_path(filepath: Union[str, Path]) -> bool:
 # =============================================================================
 
 
+_HEADING_ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\ufeff]")
+
+
+def _normalize_heading_text(value: str) -> str:
+    """Tolerant heading comparison form (mirror of the writer's, kept local
+    to avoid a dependency edge into worker_agents): remove zero-width
+    chars, casefold, collapse whitespace to single spaces, strip trailing
+    punctuation (\u2026 and :;.-—)."""
+    s = _HEADING_ZERO_WIDTH_RE.sub("", value or "")
+    s = " ".join(s.split()).casefold()
+    return s.rstrip(" \t.:;.-—…")
+
+
 def _render_span(text: str, citations) -> str:
     """Render one span: its text followed by [^n] footnote markers."""
     out = text or ""
@@ -1090,10 +1103,25 @@ def render_markdown(report) -> str:
             lines.append(str(para).strip())
             lines.append("")
 
+    section_headings = [_normalize_heading_text(s.heading) for s in report.sections]
     for section in report.sections:
         lines.append(f"### {section.heading}")
         lines.append("")
-        for block in section.blocks:
+        blocks = list(section.blocks or [])
+        # Skip a LEADING heading block whose text duplicates this section's
+        # own heading (or any sibling section's heading — a phantom
+        # boundary): the heading line above already prints it, so a block
+        # restating it would render the title twice. Only blocks[0] is
+        # considered; later subsection headings always render.
+        if blocks and blocks[0].type == "heading":
+            first_text = (
+                "".join(_render_span(s.text, s.citations) for s in blocks[0].spans)
+                or blocks[0].text
+            )
+            first_norm = _normalize_heading_text(first_text)
+            if first_norm and first_norm in section_headings:
+                blocks = blocks[1:]
+        for block in blocks:
             block_lines = _render_block(block)
             if block_lines:
                 lines.extend(block_lines)
