@@ -38,15 +38,24 @@ def _extract_json_object(text: str) -> dict | None:
     if fence:
         candidate = fence.group(1).strip()
     parsed = []
+    spans: list[tuple[int, int]] = []
     for i, ch in enumerate(candidate):
         if ch != "{":
             continue
         try:
-            obj, _end = _JSON_DECODER.raw_decode(candidate, i)
+            obj, end = _JSON_DECODER.raw_decode(candidate, i)
         except ValueError:
             continue
-        if isinstance(obj, dict):
-            parsed.append(obj)
+        if not isinstance(obj, dict):
+            continue
+        # Skip objects nested INSIDE an earlier-parsed object: when the
+        # response holds one top-level object, its inner dicts are parts of
+        # it, not competing objects (e.g. a report's section entries must
+        # not be preferred over the report itself).
+        if any(start <= i < e for start, e in spans):
+            continue
+        parsed.append(obj)
+        spans.append((i, end))
     for obj in parsed:
         if "blocks" in obj or "heading" in obj:
             return obj
@@ -83,6 +92,29 @@ def _looks_truncated_json(text: str) -> bool:
     if fence:
         candidate = fence.group(1)
     return candidate.count("{") > candidate.count("}")
+
+
+# Bounded per-run budget for truncated-draft retries: a truncated
+# section/synthesis draft gets ONE retry at 2x max_output_tokens, and the
+# budget keeps a chronically truncating model from eating the whole run's
+# LLM allowance. Reset at the start of each deep run (deep_research) and in
+# tests.
+_writer_retry_budget = 4
+
+
+def reset_writer_retry_budget(n: int = 4) -> None:
+    """Reset the per-run truncation-retry budget (call at run start)."""
+    global _writer_retry_budget
+    _writer_retry_budget = max(0, int(n))
+
+
+def _take_writer_retry() -> bool:
+    """Consume one retry if the budget allows; False when spent."""
+    global _writer_retry_budget
+    if _writer_retry_budget <= 0:
+        return False
+    _writer_retry_budget -= 1
+    return True
 
 
 def _slug(heading: str) -> str:
@@ -494,6 +526,28 @@ def write_section(
 
     if output_format == "json":
         obj = _extract_json_object(text)
+        if (
+            obj is None
+            and (_is_truncated_response(response) or _looks_truncated_json(text))
+            and _take_writer_retry()
+        ):
+            if verbose:
+                print(
+                    f"[WRITER] WARNING: '{section_heading}' output looks truncated; "
+                    "retrying at 2x max_output_tokens"
+                )
+            response = run_model(
+                instructions=instructions,
+                input_data=input_text,
+                reasoning_effort=config.get_reasoning_effort("writer"),
+                max_output_tokens=2 * config.get_max_output_tokens("writer"),
+                tools=None,
+                agent_name="writer",
+                endpoint=endpoint,
+                api_key=api_key,
+            )
+            text = (response.output_text or "").strip()
+            obj = _extract_json_object(text)
         if obj is not None:
             try:
                 section = Section.model_validate(obj)
@@ -605,6 +659,28 @@ def write_synthesis(
 
     if output_format == "json":
         obj = _extract_json_object(text)
+        if (
+            obj is None
+            and (_is_truncated_response(response) or _looks_truncated_json(text))
+            and _take_writer_retry()
+        ):
+            if verbose:
+                print(
+                    "[WRITER] WARNING: synthesis output looks truncated; "
+                    "retrying at 2x max_output_tokens"
+                )
+            response = run_model(
+                instructions=instructions,
+                input_data=input_text,
+                reasoning_effort=config.get_reasoning_effort("writer"),
+                max_output_tokens=2 * config.get_max_output_tokens("writer"),
+                tools=None,
+                agent_name="writer",
+                endpoint=endpoint,
+                api_key=api_key,
+            )
+            text = (response.output_text or "").strip()
+            obj = _extract_json_object(text)
         if obj is not None:
             try:
                 section = Section.model_validate(obj)
