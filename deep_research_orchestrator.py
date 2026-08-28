@@ -862,7 +862,14 @@ def deep_research(
         # ------------------------------------------------------------------
         _notify_stage(4, "critic pass: checking every drafted section")
         if sections:
-            draft_text = "\n\n".join(_section_text_str(text) for _sid, _h, text in sections)
+            # Every section gets a "## heading (id: …)" boundary even when
+            # its content is empty, so the critic can see (and verdict) each
+            # section — matches its "one section per ## heading, labeled
+            # with its id" contract.
+            draft_text = "\n\n".join(
+                f"## {heading} (id: {sid})\n\n{_section_text_str(text)}"
+                for sid, heading, text in sections
+            )
             section_ids = [sq_id for sq_id, _h, _t in sections]
             if budget.can_afford(1):
                 critic = verification_critic(
