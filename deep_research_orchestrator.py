@@ -26,6 +26,7 @@ Standard mode (orchestrator_agent) is NOT modified.
 import importlib
 import json
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -107,13 +108,28 @@ class _LLMBudget:
             print(f"[DEEP] LLM call {self.count}/{self.limit} ({label})")
 
 
+# Per-symbol stacks of previously bound run_model implementations. The
+# install/restore pair must be re-entrancy safe: an install pushes the
+# CURRENTLY-BOUND function (whatever it is) onto the symbol's stack, and a
+# restore pops it and rebinds the new top — so overlapping deep runs unwind
+# in exactly the order they nested, never leaving a stale wrapper bound.
+_run_model_stacks: Dict[Any, list] = {}
+
+# Deep runs are long; serializing them is the safe net for the process-wide
+# run_model swap below (two overlapping runs would otherwise cross-charge
+# each other's budgets, and a late restore would poison standard-mode calls).
+_deep_run_lock = threading.Lock()
+
+
 def _install_tracked_run_models(budget: _LLMBudget, verbose: bool) -> list:
     """Swap each agent module's run_model with a budget-charging wrapper.
 
     The agents call `run_model` via their own module globals, so the swap
-    must happen per module. Returns (module, original) pairs for restore.
+    must happen per module. Each previously bound function is pushed onto
+    its symbol's stack (see _run_model_stacks). Returns (module, saved)
+    pairs for _restore_tracked_run_models.
     """
-    originals = []
+    saved = []
     for module, label in (
         (_decomposition_mod, "decomposer"),
         (_retriever_mod, "sufficiency/retriever"),
@@ -121,6 +137,8 @@ def _install_tracked_run_models(budget: _LLMBudget, verbose: bool) -> list:
         (_verifier_mod, "critic"),
     ):
         original = module.run_model
+        _run_model_stacks.setdefault(module, []).append(original)
+        saved.append((module, original))
 
         def make_wrapper(original, label):
             def wrapper(*args, **kwargs):
@@ -130,13 +148,19 @@ def _install_tracked_run_models(budget: _LLMBudget, verbose: bool) -> list:
             return wrapper
 
         module.run_model = make_wrapper(original, label)
-        originals.append((module, original))
-    return originals
+    return saved
 
 
 def _restore_tracked_run_models(originals: list) -> None:
-    for module, original in originals:
-        module.run_model = original
+    for module, original in reversed(originals):
+        stack = _run_model_stacks.get(module, [])
+        if stack and stack[-1] is original:
+            stack.pop()
+            module.run_model = stack[-1] if stack else original
+        else:
+            # Defensive (should not happen under _deep_run_lock): rebind
+            # exactly what was bound before this install.
+            module.run_model = original
 
 
 def _read_doc_catalog() -> List[Dict[str, str]]:
@@ -624,6 +648,8 @@ def deep_research(
         stats["sections"] = len(sections)
         return {"final_answer": final_answer, "state": state, "stats": stats}
 
+    # Serialize deep runs (the tracked run_model swap is process-global).
+    _deep_run_lock.acquire()
     originals = _install_tracked_run_models(budget, verbose)
     try:
         # ------------------------------------------------------------------
@@ -1366,3 +1392,4 @@ def deep_research(
         return _finish(final_answer)
     finally:
         _restore_tracked_run_models(originals)
+        _deep_run_lock.release()
