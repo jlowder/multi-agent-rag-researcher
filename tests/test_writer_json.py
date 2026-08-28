@@ -492,3 +492,78 @@ def test_content_filter_termination_does_not_retry(monkeypatch):
     assert len(calls) == 1
     assert section.blocks == []
     assert section.heading == "Market"
+
+
+# ---------------------------------------------------------------------------
+# C1/C2/C3 robustness: lenient cells, whole-object salvage, premature-close
+# recovery
+# ---------------------------------------------------------------------------
+
+
+def test_string_cell_table_section_validates(monkeypatch):
+    # A whole-object table with bare-string cells must validate end-to-end
+    # (lenient coercion) and come back with proper spans.
+    table = {
+        "type": "comparison_table",
+        "caption": "c",
+        "columns": ["A", "B"],
+        "rows": [["x", "y"], ["z", "w"]],
+    }
+    text = json.dumps({"id": "market", "heading": "Market", "blocks": [table]})
+    section, _ = _write_section(monkeypatch, text)
+    assert section.heading == "Market"
+    assert len(section.blocks) == 1
+    assert section.blocks[0].rows[0][0].text == "x"
+    assert section.blocks[0].rows[0][0].citations == []
+    assert section.blocks[0].rows[1][1].text == "w"
+
+
+def test_salvage_keeps_valid_blocks_after_failed_validation(monkeypatch):
+    # The object contains one valid block and one block with a bad type:
+    # whole-object validation fails, but the good block must be salvaged
+    # instead of the whole section soft-failing to empty.
+    text = json.dumps(
+        {
+            "id": "market",
+            "heading": "Market",
+            "blocks": [
+                {
+                    "type": "paragraph",
+                    "spans": [{"text": "good paragraph words", "citations": ["D1"]}],
+                },
+                {"type": "nonsense"},
+            ],
+        }
+    )
+    section, _ = _write_section(monkeypatch, text)
+    assert section.heading == "Market"
+    assert len(section.blocks) == 1
+    assert section.blocks[0].type.value == "paragraph"
+    assert section.blocks[0].spans[0].text == "good paragraph words"
+
+
+def test_premature_close_recovers_trailing_blocks(monkeypatch):
+    # Model closed the section object after one block, then kept writing
+    # more block objects: all of them must survive.
+    para = {"type": "paragraph", "spans": [{"text": "first block text", "citations": ["D1"]}]}
+    heading = {"type": "heading", "level": 3, "text": "More"}
+    table = {"type": "comparison_table", "caption": "c", "columns": ["A"], "rows": [["cell"]]}
+    closed = json.dumps({"id": "market", "heading": "Market", "blocks": [para]})
+    text = closed + "," + json.dumps(heading) + "," + json.dumps(table)
+    section, _ = _write_section(monkeypatch, text)
+    assert [b.type.value for b in section.blocks] == [
+        "paragraph",
+        "heading",
+        "comparison_table",
+    ]
+    assert section.blocks[2].rows[0][0].text == "cell"
+
+
+def test_trailing_prose_is_ignored(monkeypatch):
+    # Trailing text with no valid block objects must not create blocks.
+    para = {"type": "paragraph", "spans": [{"text": "only block", "citations": ["D1"]}]}
+    closed = json.dumps({"id": "market", "heading": "Market", "blocks": [para]})
+    text = closed + " " + ("prose without braces here " * 30)
+    section, _ = _write_section(monkeypatch, text)
+    assert len(section.blocks) == 1
+    assert section.blocks[0].spans[0].text == "only block"
