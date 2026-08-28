@@ -105,6 +105,13 @@ def _para(text_cits) -> ReportBlock:
     )
 
 
+def _pad_span(n: int = 40):
+    """(text, citations) filler: pushes a stub section past the assemble
+    ship-guard's 30-word floor so tests of other behavior are unaffected.
+    Citations on the real spans above are what those tests exercise."""
+    return (" ".join(f"fact{i}" for i in range(n)), [])
+
+
 def _all_citations(rep: ResearchReport):
     return [
         c
@@ -176,8 +183,8 @@ class TestAssemble:
         )
 
     def test_renumber_first_appearance_order(self):
-        s1 = Section(id="s1", heading="One", blocks=[_para([("A.", ["W1", "D1"]), ("B.", [])])])
-        s2 = Section(id="s2", heading="Two", blocks=[_para([("C.", ["D2"]), ("D.", ["W1"])])])
+        s1 = Section(id="s1", heading="One", blocks=[_para([("A.", ["W1", "D1"]), ("B.", []), _pad_span()])])
+        s2 = Section(id="s2", heading="Two", blocks=[_para([("C.", ["D2"]), ("D.", ["W1"]), _pad_span()])])
         reg = {"D1": dict(DOC_A), "D2": dict(DOC_B), "W1": dict(WEB_A)}
         rep = self._assemble(s1, s2, registry=reg)
         assert _all_citations(rep) == ["1", "2", "3", "1"]
@@ -186,20 +193,27 @@ class TestAssemble:
         assert all(s.citation_key for s in rep.report.sources)
 
     def test_invented_key_dropped_and_flagged(self):
-        s1 = Section(id="s1", heading="One", blocks=[_para([("A.", ["W1"]), ("B.", ["D9"])])])
+        s1 = Section(id="s1", heading="One", blocks=[_para([("A.", ["W1"]), ("B.", ["D9"]), _pad_span()])])
         rep = self._assemble(s1, registry={"W1": dict(WEB_A)})
         assert _all_citations(rep) == ["1"]
         assert rep.quality.verification.get("unresolvable_citations") == ["D9"]
 
     def test_bare_numeric_out_of_range_dropped(self):
-        block = ReportBlock(type=BlockType.paragraph, text="Bare.", citations=["7", "W1"])
+        block = ReportBlock(
+            type=BlockType.paragraph,
+            # Filler words in the block text (the citation shorthand only
+            # merges into a span when the block has none) keep this section
+            # past the ship-guard's 30-word floor.
+            text="Bare. " + " ".join(f"fact{i}" for i in range(40)),
+            citations=["7", "W1"],
+        )
         s1 = Section(id="s1", heading="One", blocks=[block])
         rep = self._assemble(s1, registry={"W1": dict(WEB_A)})
         assert _all_citations(rep) == ["1"]
         assert "7" in rep.quality.verification.get("dropped_bare_citations", [])
 
     def test_quality_metrics(self):
-        s1 = Section(id="s1", heading="One", blocks=[_para([("A fact here.", ["W1"])])])
+        s1 = Section(id="s1", heading="One", blocks=[_para([("A fact here.", ["W1"]), _pad_span()])])
         rep = self._assemble(s1, registry={"W1": dict(WEB_A)})
         assert rep.report.metadata.title == "T"
         assert rep.report.executive_summary == ["Ex."]
@@ -209,12 +223,19 @@ class TestAssemble:
         assert isinstance(rep.quality.citation_density, dict)
 
     def test_empty_section_soft(self):
+        # Ship guard: an empty section ships with a gap-notice paragraph
+        # (heading preserved) plus a verification gap — never bare.
         rep = self._assemble(
             Section(id="s1", heading="Empty", blocks=[]), registry={}
         )
-        assert rep.report.sections[0].blocks == []
+        assert rep.report.sections[0].heading == "Empty"
+        notice = rep.report.sections[0].blocks[0]
+        assert notice.type == BlockType.paragraph
+        assert "no content was generated" in notice.spans[0].text
         assert rep.report.sources == []
-        assert rep.quality.total_words == 1  # the section heading counts
+        # 1 exec word + 19 gap-notice words (no blocks otherwise).
+        assert rep.quality.total_words == 20
+        assert rep.quality.verification["gaps"] == ["not_generated: Empty"]
         assert isinstance(rep.quality.citation_density, dict)
 
 
@@ -306,6 +327,13 @@ def _json_section(i):
                         "spans": [
                             {"text": "First fact.", "citations": ["W1"]},
                             {"text": "Doc fact.", "citations": ["D1"]},
+                            # Past the assemble ship-guard's 30-word floor.
+                            {
+                                "text": " ".join(
+                                    f"fact{i}" for i in range(40)
+                                ),
+                                "citations": [],
+                            },
                         ],
                     }
                 ],
@@ -323,6 +351,13 @@ def _json_section(i):
                             {"text": "Second doc fact.", "citations": ["D2"]},
                             {"text": "Invented key fact.", "citations": ["D9"]},
                             {"text": "Back to web.", "citations": ["W1"]},
+                            # Past the assemble ship-guard's 30-word floor.
+                            {
+                                "text": " ".join(
+                                    f"fact{i}" for i in range(40)
+                                ),
+                                "citations": [],
+                            },
                         ],
                     }
                 ],
