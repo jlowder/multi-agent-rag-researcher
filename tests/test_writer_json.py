@@ -469,3 +469,26 @@ def test_extract_prefers_largest_keyed_dict_over_prose_decoy():
     small = '{"id": "a", "heading": "A", "blocks": []}'
     text3 = small + "\n" + real
     assert wmod._extract_json_object(text3)["id"] == "market"
+
+
+def test_content_filter_termination_does_not_retry(monkeypatch):
+    # status="incomplete" with a NON-length reason (content_filter) must
+    # NOT trigger the 2x retry — the filter will fire again.
+    monkeypatch.setattr(wmod, "get_config", lambda: _FakeConfig())
+    # No braces at all: the brace-balance heuristic stays quiet, so only the
+    # response-status signal is under test here.
+    filtered = "the response was filtered by the safety policy"
+    calls = _patch_run_model_seq(
+        monkeypatch,
+        [
+            _FakeResponse(
+                filtered,
+                status="incomplete",
+                incomplete_details={"reason": "content_filter"},
+            )
+        ],
+    )
+    section = wmod.write_section(**_section_kwargs())
+    assert len(calls) == 1
+    assert section.blocks == []
+    assert section.heading == "Market"

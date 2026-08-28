@@ -68,22 +68,24 @@ def _extract_json_object(text: str) -> dict | None:
 
 
 def _is_truncated_response(response) -> bool:
-    """True when the API signals the response was cut short.
+    """True when the API signals the response was cut short by OUTPUT
+    LENGTH — the one case a 2x retry can help.
 
-    status == "incomplete", or incomplete_details (object or dict form)
-    with reason == "max_output_tokens". Tolerates missing attributes.
+    When incomplete_details is present it is authoritative: only
+    reason == "max_output_tokens" counts (a content_filter termination
+    will filter again at 2x — retrying is pointless). The bare
+    status == "incomplete" check is used only when details is missing.
+    Tolerates missing attributes.
     """
-    if getattr(response, "status", None) == "incomplete":
-        return True
     details = getattr(response, "incomplete_details", None)
-    if details is None:
-        return False
-    reason = (
-        details.get("reason")
-        if isinstance(details, dict)
-        else getattr(details, "reason", None)
-    )
-    return reason == "max_output_tokens"
+    if details is not None:
+        reason = (
+            details.get("reason")
+            if isinstance(details, dict)
+            else getattr(details, "reason", None)
+        )
+        return reason == "max_output_tokens"
+    return getattr(response, "status", None) == "incomplete"
 
 
 def _looks_truncated_json(text: str) -> bool:
