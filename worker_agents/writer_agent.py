@@ -117,6 +117,32 @@ def _take_writer_retry() -> bool:
     return True
 
 
+_HEADING_ZERO_WIDTH = "\u200b\u200c\u200d\u2060\ufeff"
+
+
+def _normalize_heading(text: str) -> str:
+    """Tolerant heading comparison form: strip zero-width chars, collapse
+    whitespace, casefold, and drop trailing punctuation (:;.-—…)."""
+    s = "".join(ch for ch in (text or "") if ch not in _HEADING_ZERO_WIDTH)
+    s = " ".join(s.split()).casefold()
+    return s.rstrip(" \t.:;.-—…")
+
+
+def _strip_duplicate_heading(section: Section) -> None:
+    """Drop blocks[0] when it re-emits the section's own title (tolerant
+    match on the normalized text). Only the FIRST block is considered —
+    later subsection headings are never touched. Mutates section in place.
+    """
+    if not section.blocks:
+        return
+    first = section.blocks[0]
+    if first.type != "heading":
+        return
+    text = "".join(span.text for span in first.spans or []) or first.text
+    if _normalize_heading(text) and _normalize_heading(text) == _normalize_heading(section.heading):
+        section.blocks = section.blocks[1:]
+
+
 def _slug(heading: str) -> str:
     """Lowercase-hyphen slug: non-alphanumeric runs collapse to one '-'."""
     return re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-")
@@ -560,6 +586,7 @@ def write_section(
                     section.heading = section_heading
                 if not section.id:
                     section.id = _slug(section_heading)
+                _strip_duplicate_heading(section)
                 return section
             except Exception:
                 pass
@@ -698,6 +725,7 @@ def write_synthesis(
                     section.heading = "Synthesis"
                 if not section.id:
                     section.id = "synthesis"
+                _strip_duplicate_heading(section)
                 return section
             except Exception:
                 pass
