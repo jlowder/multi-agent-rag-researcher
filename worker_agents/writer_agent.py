@@ -53,6 +53,38 @@ def _extract_json_object(text: str) -> dict | None:
     return parsed[0] if parsed else None
 
 
+def _is_truncated_response(response) -> bool:
+    """True when the API signals the response was cut short.
+
+    status == "incomplete", or incomplete_details (object or dict form)
+    with reason == "max_output_tokens". Tolerates missing attributes.
+    """
+    if getattr(response, "status", None) == "incomplete":
+        return True
+    details = getattr(response, "incomplete_details", None)
+    if details is None:
+        return False
+    reason = (
+        details.get("reason")
+        if isinstance(details, dict)
+        else getattr(details, "reason", None)
+    )
+    return reason == "max_output_tokens"
+
+
+def _looks_truncated_json(text: str) -> bool:
+    """Heuristic for a cut-off JSON object: after stripping one
+    full-response code fence, more "{" than "}" means the object never
+    closed."""
+    if not text:
+        return False
+    candidate = text.strip()
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, re.DOTALL)
+    if fence:
+        candidate = fence.group(1)
+    return candidate.count("{") > candidate.count("}")
+
+
 def _slug(heading: str) -> str:
     """Lowercase-hyphen slug: non-alphanumeric runs collapse to one '-'."""
     return re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-")
