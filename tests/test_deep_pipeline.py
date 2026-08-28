@@ -956,3 +956,101 @@ def test_critic_low_citation_density_triggers_revision(monkeypatch):
     by_id = {e["section_id"]: e for e in result["state"]["critic"]["per_section"]}
     assert by_id["sq1"]["citation_density_ok"] is False
     assert by_id["sq2"]["citation_density_ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Deterministic must-revise + critic draft boundaries (stage 4)
+# ---------------------------------------------------------------------------
+
+
+def test_must_revise_empty_section_even_when_critic_all_pass(monkeypatch):
+    # One stage-3 draft soft-fails to an EMPTY Section (json mode); the
+    # critic says everything is fine. The deterministic must-revise pass
+    # must still rewrite the empty section, and the revision ships.
+    def writer_text(i, k):
+        if "REVISION REQUIRED" in (k.get("input_data") or ""):
+            return json.dumps(
+                {
+                    "id": "section-two",
+                    "heading": "Section Two",
+                    "blocks": [
+                        {
+                            "type": "paragraph",
+                            "spans": [
+                                {
+                                    "text": "Revised full body with substance. "
+                                    + " ".join(
+                                        f"fact{i}" for i in range(40)
+                                    ),
+                                    "citations": [],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+        if i == 1:
+            return "garbage, no JSON object here"
+        return _json_writer(i)
+
+    env = _basic_env(writer_text=writer_text)
+    env["pad_writer"] = False
+    writer_calls = _install_stubs(monkeypatch, env)
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+
+    assert result["stats"]["revisions"] == 1
+    revision = [c for c in writer_calls if "REVISION REQUIRED" in (c.get("input_data") or "")]
+    assert len(revision) == 1
+    assert "Section Two" in revision[0]["input_data"]
+    # The must-revise output is what ships.
+    assert "Revised full body with substance." in result["final_answer"]
+
+
+def test_critic_draft_shows_boundary_for_empty_section(monkeypatch):
+    # The critic's draft text carries a "## heading (id: sid)" boundary per
+    # section — including for a section whose draft is empty.
+    critic_inputs = []
+
+    def writer_text(i, k):
+        if i == 1:
+            return "garbage, no JSON object here"
+        return _json_writer(i)
+
+    env = _basic_env(writer_text=writer_text)
+    env["pad_writer"] = False
+    _install_stubs(monkeypatch, env)
+    monkeypatch.setattr(
+        vmod,
+        "run_model",
+        lambda *a, **k: (critic_inputs.append(k), _FakeResponse(text=CRITIC_OK_JSON))[1],
+    )
+    dpo.deep_research("test query", verbose=False, max_rounds=3)
+
+    assert critic_inputs, "critic was never called"
+    draft = critic_inputs[0].get("input_data") or ""
+    assert "## Section One (id: sq1)" in draft
+    assert "## Section Two (id: sq2)" in draft
+
+
+def test_tracked_run_model_stack_reentrant():
+    # Two install/restore cycles (as nested deep runs would under the lock)
+    # must unwind back to each agent module's original run_model, with no
+    # stack residue.
+    agents = (dmod, rmod, wmod, vmod)
+    originals = {id(m): m.run_model for m in agents}
+    s1 = dpo._install_tracked_run_models(dpo._LLMBudget(40), False)
+    try:
+        s2 = dpo._install_tracked_run_models(dpo._LLMBudget(40), False)
+        assert all(m.run_model is not originals[id(m)] for m in agents)
+        dpo._restore_tracked_run_models(s2)  # inner run unwinds first
+    finally:
+        dpo._restore_tracked_run_models(s1)
+    for m in agents:
+        assert m.run_model is originals[id(m)]
+        assert not dpo._run_model_stacks.get(m)
+    # A second sequential cycle also ends clean.
+    s3 = dpo._install_tracked_run_models(dpo._LLMBudget(40), False)
+    dpo._restore_tracked_run_models(s3)
+    for m in agents:
+        assert m.run_model is originals[id(m)]
+        assert not dpo._run_model_stacks.get(m)

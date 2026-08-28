@@ -496,3 +496,42 @@ def test_deep_research_json_mode_e2e(monkeypatch):
 
     # Writer JSON mode was actually used (two section calls, no synthesis).
     assert len(calls) == 2
+
+
+def test_assemble_guards_preserve_existing_gaps_and_drop_empty_synthesis():
+    # 5-word content section -> gap notice + "not_generated" gap appended
+    # AFTER the existing verification gaps; 500-word section untouched;
+    # empty synthesis dropped (degradation shape). render_markdown must run
+    # on the result.
+    short = Section(
+        id="s1",
+        heading="Short Area",
+        blocks=[_para([("Tiny bit.", []), ("More words.", []), ("Here.", []), ("Now.", []), ("Five.", [])])],
+    )
+    long = Section(
+        id="s2",
+        heading="Long Area",
+        blocks=[_para([(" ".join(f"word{i}" for i in range(500)), [])])],
+    )
+    empty_synth = Section(id="synthesis", heading="Synthesis", blocks=[])
+    rep = assemble_structured_report(
+        sections=[short, long, empty_synth],
+        registry={},
+        user_query="q",
+        session_id="s1",
+        exec_paragraphs=["Ex."],
+        verification_status={"gaps": ["existing gap"]},
+        title="T",
+    )
+    assert [s.heading for s in rep.report.sections] == ["Short Area", "Long Area"]
+    assert "no content was generated" in rep.report.sections[0].blocks[0].spans[0].text
+    assert rep.report.sections[1].blocks[0].spans[0].text.startswith("word0")
+    assert rep.quality.verification["gaps"] == [
+        "existing gap",
+        "not_generated: Short Area",
+    ]
+    from memory.save_report import render_markdown
+
+    md = render_markdown(rep)
+    assert "### Short Area" in md and "### Long Area" in md
+    assert "Synthesis" not in md
