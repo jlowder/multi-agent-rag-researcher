@@ -173,6 +173,7 @@ def clear_chat(state: dict) -> tuple[list, dict, str]:
     # Preserve report fields on clear
     next_state["last_report"] = state.get("last_report", "")
     next_state["last_report_query"] = state.get("last_report_query", "")
+    next_state["last_report_title"] = state.get("last_report_title", "")
     next_state["last_report_state"] = state.get("last_report_state")
     return [], next_state, status_text(next_state)
 
@@ -235,6 +236,7 @@ def handle_save_report(state: dict) -> str:
             session_id=session_id,
             state=report_state,
             config=config,
+            title=state.get("last_report_title", ""),
         )
         return f"Report saved to: {path}"
     path = save_report(
@@ -242,6 +244,7 @@ def handle_save_report(state: dict) -> str:
         query=query,
         session_id=session_id,
         config=ReportConfig.research(),
+        title=state.get("last_report_title", ""),
     )
     return f"Report saved to: {path}"
 
@@ -321,6 +324,10 @@ def _chat_deep(message: str, history: list[dict], state: dict):
                 answer = result.get("final_answer", "")
                 state["last_report"] = answer
                 state["last_report_query"] = message
+                # Deep runs title via metadata.title (structured save); clear
+                # any stale standard-run title so the legacy-deep markdown
+                # branch below falls back to the query.
+                state["last_report_title"] = ""
                 state["last_report_state"] = result.get("state") or {}
                 history[-1] = {"role": "assistant", "content": answer}
                 yield "", history, state, (
@@ -424,6 +431,15 @@ def chat(message: str, history: list[dict] | None, state: dict, file_paths: list
                         # Store report for save button
                         state["last_report"] = result.get("final_answer", "")
                         state["last_report_query"] = message
+                        # LLM title for the save filename ("" on any failure
+                        # -> save_report keeps the query-based name).
+                        try:
+                            from worker_agents.decomposition_agent import (
+                                generate_report_title,
+                            )
+                            state["last_report_title"] = generate_report_title(message)
+                        except Exception:
+                            state["last_report_title"] = ""
                         # A standard run has no nested pipeline state: clear any
                         # stale deep-run state so Save doesn't attach the old
                         # run's evidence/side-file to this report.

@@ -107,10 +107,18 @@ def chat_with_supervisor(
             )
             print(f"Report saved to: {saved_path}")
         elif answer:
+            # LLM title for the filename: one short decomposer-model call;
+            # "" on any failure (save_report then keeps the query-based name).
+            try:
+                from worker_agents.decomposition_agent import generate_report_title
+                title = generate_report_title(user_query, verbose=debug)
+            except Exception:
+                title = ""
             # Pass the full orchestration state to save_report for enriched reporting
             saved_path = save_report(
                 content=answer,
                 query=user_query,
+                title=title,
                 session_id=session_id,
                 state=save_state,  # state with evidence, verification, etc.
                 config=save_config  # research config; deep adds the evidence dump
