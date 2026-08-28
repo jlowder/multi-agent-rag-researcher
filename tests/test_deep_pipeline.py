@@ -162,7 +162,16 @@ def _install_stubs(monkeypatch, env: dict) -> dict:
 
     def writer_stub(*a, **k):
         writer_calls.append(k)
-        return _FakeResponse(text=env["writer_text"](len(writer_calls) - 1, k))
+        text = env["writer_text"](len(writer_calls) - 1, k)
+        # The writer contract requires ~300+ words of substance; pad the
+        # canned stubs up to that floor so the deterministic must-revise
+        # (empty / <300-word section) does not fire in tests that are not
+        # about it. (env may opt out with "pad_writer": False.)
+        if env.get("pad_writer", True) and len(text.split()) < 300:
+            text = text + " " + " ".join(
+                f"token{i}" for i in range(320 - len(text.split()))
+            )
+        return _FakeResponse(text=text)
 
     monkeypatch.setattr(dmod, "run_model", lambda *a, **k: _FakeResponse(text=env["plan_json"]))
     monkeypatch.setattr(rmod, "run_model", lambda *a, **k: _FakeResponse(text=env["sufficiency_json"]))
@@ -191,6 +200,24 @@ def _basic_env(critic_text: str = CRITIC_OK_JSON, writer_text=None) -> dict:
         "web_results": _default_web_results,
         "exec_text": "Synthesized executive summary prose.",
     }
+
+
+def _json_writer(i: int) -> str:
+    """Contract-compliant JSON section for json-mode pipeline tests: a
+    valid, non-empty Section, so the deterministic must-revise backstop
+    (which rewrites empty-Section / <300-word drafts) stays silent."""
+    return json.dumps(
+        {
+            "id": f"section-{i + 1}",
+            "heading": f"Section {i + 1}",
+            "blocks": [
+                {
+                    "type": "paragraph",
+                    "spans": [{"text": f"Body for section {i + 1}.", "citations": []}],
+                }
+            ],
+        }
+    )
 
 
 def _run(monkeypatch, env, **kw) -> dict:
@@ -446,8 +473,12 @@ def test_decompose_fallback_retries_once_and_keeps_bigger_plan(monkeypatch, caps
             return _FakeResponse(text="total garbage, no JSON in sight")
         return _FakeResponse(text=PLAN_JSON)
 
+    env = _basic_env()
+    # json-mode run: the markdown stubs would soft-fail to empty Sections,
+    # which the must-revise backstop would then rewrite (changing call counts).
+    env["writer_text"] = lambda i, k: _json_writer(i)
     result = _run_with_decompose_stub(
-        monkeypatch, _basic_env(), decompose_stub, verbose=True
+        monkeypatch, env, decompose_stub, verbose=True
     )
     out = capsys.readouterr().out
 
@@ -774,7 +805,7 @@ def test_synthesis_skipped_on_budget_exec_summary_still_writes(monkeypatch):
     # 3 drafts + critic); limit 9 leaves exactly 1 call → synthesis (needs
     # 2: itself + exec summary) is skipped, exec summary still writes.
     def writer_text(i, k):
-        return f"## Section {i + 1} body [W1]."
+        return _json_writer(i)
 
     env = _basic_env(writer_text=writer_text)
     env["plan_json"] = PLAN_JSON_3SQ
@@ -816,7 +847,9 @@ def test_synthesis_failure_leaves_report_intact(monkeypatch):
 
 def test_synthesis_skipped_when_too_few_sections(monkeypatch):
     # T4: default plan = 2 sub-questions → synthesis never called.
-    writer_calls = _install_stubs(monkeypatch, _basic_env())
+    env = _basic_env()
+    env["writer_text"] = lambda i, k: _json_writer(i)
+    writer_calls = _install_stubs(monkeypatch, env)
     result = dpo.deep_research("test query", verbose=False, max_rounds=3)
 
     assert not _synth_calls(writer_calls)

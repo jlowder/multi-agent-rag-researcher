@@ -884,7 +884,8 @@ def deep_research(
             else:
                 print(
                     "[DEEP] WARNING: LLM budget exhausted before the critic; "
-                    "skipping verification and revisions."
+                    "skipping verification (deterministic revisions may still "
+                    "run if budget allows)."
                 )
 
             added_docs: List[dict] = []
@@ -942,27 +943,54 @@ def deep_research(
                     )
 
             # Revisions: weak sections go back to write_section with gaps.
-            if critic:
+            # Two deduped sources, at most ONE revision per section per
+            # pass: the critic's verdicts (failed flags + its gaps) and the
+            # deterministic must-revise set — a draft that is empty (a
+            # truncation soft-fail yields a heading-only Section) or too
+            # short is rewritten even when the critic is None or all-pass.
+            MUST_REVISE_GAP = (
+                "This section has no/little content. Write the full section "
+                "(~300-1100 words) from the provided evidence; do not restate "
+                "the title as a heading."
+            )
+            must_revise = {
+                sid
+                for sid, _h, text in sections
+                if (isinstance(text, str) and len(text.split()) < 300)
+                or (hasattr(text, "blocks") and not text.blocks)
+            }
+            revision_queue: List[tuple] = []
+            queued: set = set()
+            verdicts = (critic.get("per_section") or []) if critic else []
+            for verdict in verdicts:
+                if not isinstance(verdict, dict):
+                    continue
+                if (
+                    verdict.get("grounded", True)
+                    and verdict.get("depth_ok", True)
+                    and verdict.get("citation_density_ok", True)
+                ):
+                    continue
+                gaps = [g for g in (verdict.get("gaps") or []) if g and g.strip()]
+                if not gaps:
+                    continue
+                sid = str(verdict.get("section_id") or "").strip()
+                index = next(
+                    (i for i, (s, _h, _t) in enumerate(sections) if s == sid),
+                    None,
+                )
+                if index is None or sid in queued:
+                    continue
+                revision_queue.append((index, sid, gaps))
+                queued.add(sid)
+            for index, (sid, _h, _t) in enumerate(sections):
+                if sid in must_revise and sid not in queued:
+                    revision_queue.append((index, sid, [MUST_REVISE_GAP]))
+                    queued.add(sid)
+
+            if revision_queue:
                 rev_counts: Dict[str, int] = {}
-                for verdict in critic.get("per_section") or []:
-                    if not isinstance(verdict, dict):
-                        continue
-                    if (
-                        verdict.get("grounded", True)
-                        and verdict.get("depth_ok", True)
-                        and verdict.get("citation_density_ok", True)
-                    ):
-                        continue
-                    gaps = [g for g in (verdict.get("gaps") or []) if g and g.strip()]
-                    if not gaps:
-                        continue
-                    sid = str(verdict.get("section_id") or "").strip()
-                    index = next(
-                        (i for i, (s, _h, _t) in enumerate(sections) if s == sid),
-                        None,
-                    )
-                    if index is None:
-                        continue
+                for index, sid, gaps in revision_queue:
                     if (
                         stats["revisions"] >= _MAX_EXPANSION_CALLS
                         or rev_counts.get(sid, 0) >= _MAX_REVISIONS_PER_SECTION
