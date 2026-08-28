@@ -5,7 +5,7 @@ import re
 from enum import Enum
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 _CITATION_MARKER_RE = re.compile(r"\[((?:[DW]\d+|\d+)(?:\s*,\s*(?:[DW]\d+|\d+))*)\]")
 _INTERNAL_KEY_RE = re.compile(r"^[DW]\d+$")
@@ -30,6 +30,14 @@ class Span(BaseModel):
     citations: list[str] = Field(default_factory=list)
 
 
+def _coerce_span(value: Any) -> Any:
+    """Lenient cell coercion: a bare string becomes one uncited Span; dicts
+    and Span instances pass through (missing 'citations' already defaults)."""
+    if isinstance(value, str):
+        return Span(text=value, citations=[])
+    return value
+
+
 class ReportBlock(BaseModel):
     type: BlockType
     text: str = ""
@@ -43,6 +51,36 @@ class ReportBlock(BaseModel):
     callout_type: Literal["note", "warning", "info"] = "note"
     callout_title: str = ""
     language: str = ""
+
+    @field_validator("spans", "items", mode="before")
+    @classmethod
+    def _coerce_span_lists(cls, value: Any) -> Any:
+        """Weak models emit bare strings where spans/items are expected
+        ("\"rows\": [[\"a\", \"b\"]] style); coerce each str entry to a Span.
+        A single bare string is treated as a one-item list."""
+        if isinstance(value, str):
+            value = [value]
+        if isinstance(value, list):
+            return [_coerce_span(v) for v in value]
+        return value
+
+    @field_validator("rows", mode="before")
+    @classmethod
+    def _coerce_rows(cls, value: Any) -> Any:
+        """Table cells arrive as plain strings from weak models; coerce each
+        cell to a Span. Non-list rows (dicts etc.) pass through untouched so
+        they still fail validation as before."""
+        if not isinstance(value, list):
+            return value
+        rows: list[Any] = []
+        for row in value:
+            if isinstance(row, str):
+                rows.append([_coerce_span(row)])
+            elif isinstance(row, list):
+                rows.append([_coerce_span(cell) for cell in row])
+            else:
+                rows.append(row)
+        return rows
 
     @model_validator(mode="after")
     def _merge_citation_shorthand(self) -> "ReportBlock":
