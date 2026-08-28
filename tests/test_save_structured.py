@@ -332,3 +332,23 @@ class TestParseExecSummary:
 
     def test_jsonish_garbage_discarded(self):
         assert parse_exec_summary("{not json") == []
+
+
+def test_citation_token_newline_collapse():
+    # F8: a newline inside a (legacy) citation token must not split the
+    # [^n]: footnote definition line.
+    section = Section(
+        id="s1",
+        heading="S",
+        blocks=[
+            ReportBlock(
+                type=BlockType.paragraph,
+                spans=[Span(text="Fact.", citations=["1\n"])],
+            )
+        ],
+    )
+    rep = _report(sections=[section], sources=[_src("1", "Source One")])
+    md = render_markdown(rep)
+    assert "Fact.[^1]" in md
+    assert "[^1]: Source One" in md
+    assert "[^1\n" not in md

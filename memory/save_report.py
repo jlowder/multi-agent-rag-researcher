@@ -1004,11 +1004,12 @@ def _collapse_ws(value: str) -> str:
 
 def _render_span(text: str, citations) -> str:
     """Render one span: its text (whitespace collapsed, see _collapse_ws)
-    followed by [^n] footnote markers. Citation tokens are appended
-    verbatim — the collapse applies to the prose text only."""
+    followed by [^n] footnote markers. Token text is collapsed too — a
+    newline inside a (legacy/hand-authored) citation token would otherwise
+    split the [^n]: footnote definition across lines."""
     out = _collapse_ws(text)
     for c in citations or []:
-        out += f"[^{c}]"
+        out += f"[^{_collapse_ws(str(c))}]"
     return out
 
 
