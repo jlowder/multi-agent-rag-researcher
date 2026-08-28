@@ -36,6 +36,62 @@ CONTRACT:
 
 _CITATION_KEY_RE = re.compile(r"[DW]\d+")
 
+# Final ship-guard threshold: targets genuinely empty output only (the
+# writer-side 300-word contract and the orchestrator's must-revise pass are
+# the first lines of defense; this catches what slips past both).
+_MIN_SECTION_WORDS = 30
+_NOT_GENERATED_TEXT = (
+    "The available evidence does not cover this area in sufficient "
+    "detail, so no content was generated for this section."
+)
+
+
+def _content_word_count(section: Section) -> int:
+    """Whitespace word count over a section's text content (block text plus
+    span/item/cell texts). Never raises."""
+    try:
+        n = len("".join(b.text or "" for b in section.blocks).split())
+        for span in (
+            s
+            for b in section.blocks
+            for s in [*b.spans, *b.items, *(c for row in b.rows for c in row)]
+        ):
+            n += len((span.text or "").split())
+        return n
+    except Exception:
+        return 0
+
+
+def _apply_empty_section_guards(report: ResearchReport) -> list:
+    """Replace (near-)empty content sections with a gap notice and drop a
+    (near-)empty synthesis, in place. Returns the "not_generated: ..." gap
+    entries for the quality verification dict.
+
+    An empty synthesis ships as NO synthesis section — the same shape as the
+    orchestrator's synthesis_failed degradation path, which render_markdown
+    and save_structured_report already handle.
+    """
+    keep = []
+    not_generated = []
+    for section in report.report.sections:
+        is_synthesis = (
+            section.id == "synthesis"
+            or (section.heading or "").strip().casefold() == "synthesis"
+        )
+        if _content_word_count(section) < _MIN_SECTION_WORDS:
+            if is_synthesis:
+                continue
+            section.blocks = [
+                ReportBlock(
+                    type="paragraph",
+                    spans=[Span(text=_NOT_GENERATED_TEXT, citations=[])],
+                )
+            ]
+            not_generated.append(f"not_generated: {section.heading}")
+        keep.append(section)
+    report.report.sections = keep
+    return not_generated
+
 _JSON_DECODER = json.JSONDecoder()
 
 
@@ -215,6 +271,8 @@ def assemble_structured_report(
     unresolvable = find_unresolvable_citations(report, registry)
     dropped = drop_bare_numeric_citations(report, registry)
 
+    not_generated = _apply_empty_section_guards(report)
+
     cited_keys = _collect_cited_keys(report, registry)
     _renumber_json_citations(report, registry, cited_keys)
 
@@ -227,6 +285,10 @@ def assemble_structured_report(
         "unresolvable_citations": unresolvable,
         "dropped_bare_citations": dropped,
     }
+    if not_generated:
+        gaps = list(report.quality.verification.get("gaps") or [])
+        gaps.extend(not_generated)
+        report.quality.verification["gaps"] = gaps
 
     doc_count = sum(1 for s in report.report.sources if s.type == "report")
     web_count = sum(1 for s in report.report.sources if s.type == "webpage")
