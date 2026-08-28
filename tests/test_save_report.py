@@ -1,6 +1,7 @@
 """Unit tests for save_report module."""
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -418,6 +419,80 @@ class TestResearchConfig(unittest.TestCase):
         finally:
             if os.path.exists(result):
                 os.unlink(result)
+
+
+class TestTitleNaming(unittest.TestCase):
+    """LLM title kwarg: preferred for the filename; query logic is the
+    fallback. Timestamps are asserted by format, not value."""
+
+    def setUp(self):
+        self.content = "Test report content with meaningful information."
+        self.query = "Test query about climate change impacts"
+        self.session = "test_session_title"
+
+    def _cleanup(self, result):
+        if os.path.exists(result):
+            os.unlink(result)
+
+    def test_title_names_file(self):
+        result = save_report(
+            self.content, self.query, self.session,
+            title="Genetic Programming Report",
+        )
+        try:
+            self.assertIsNotNone(
+                re.fullmatch(r"genetic_programming_report_\d{8}_\d{6}", Path(result).stem),
+                result,
+            )
+        finally:
+            self._cleanup(result)
+
+    def test_no_title_keeps_query_behavior(self):
+        result = save_report(self.content, self.query, self.session)
+        try:
+            self.assertIsNotNone(
+                re.fullmatch(
+                    r"test query about climate change impacts_\d{8}_\d{6}",
+                    Path(result).stem,
+                ),
+                result,
+            )
+        finally:
+            self._cleanup(result)
+
+    def test_title_punctuation_becomes_underscores(self):
+        result = save_report(
+            self.content, self.query, self.session, title="A/B: C&D!"
+        )
+        try:
+            self.assertIsNotNone(
+                re.fullmatch(r"a_b_c_d_\d{8}_\d{6}", Path(result).stem), result
+            )
+            self.assertNotIn("/", Path(result).name)
+        finally:
+            self._cleanup(result)
+
+    def test_long_title_caps_at_word_boundary(self):
+        result = save_report(
+            self.content, self.query, self.session, title=" ".join(["word"] * 30)
+        )
+        try:
+            stem = Path(result).stem
+            m = re.fullmatch(r"(word_)*word_\d{8}_\d{6}", stem)
+            self.assertIsNotNone(m, stem)
+            base = re.sub(r"_\d{8}_\d{6}$", "", stem)
+            self.assertLessEqual(len(base), 60)
+            self.assertEqual(base, "_".join(["word"] * 12))  # 58 chars, whole tokens
+        finally:
+            self._cleanup(result)
+
+    def test_all_punctuation_title_falls_back_to_query(self):
+        result = save_report(self.content, self.query, self.session, title="!!!")
+        try:
+            self.assertIn(self.query.lower().replace("?", ""), Path(result).name)
+            self.assertFalse(Path(result).stem.startswith("_"))
+        finally:
+            self._cleanup(result)
 
 
 if __name__ == '__main__':

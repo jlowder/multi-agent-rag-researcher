@@ -259,3 +259,39 @@ class TestNormalizePlanCandidate:
         assert plan["source"] == "fallback"
         assert plan["is_simple"] is True
         assert plan["sub_questions"][0]["question"] == "my query"
+
+
+class TestGenerateReportTitle:
+    def test_strips_whitespace_and_quotes(self, monkeypatch):
+        def fake(*args, **kwargs):
+            return _FakeResponse(output_text="  Genetic Programming Report\n")
+
+        monkeypatch.setattr(decomposition_agent, "run_model", fake)
+        assert decomposition_agent.generate_report_title("some request") == "Genetic Programming Report"
+
+    def test_call_failure_returns_empty(self, monkeypatch):
+        def fake(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(decomposition_agent, "run_model", fake)
+        assert decomposition_agent.generate_report_title("some request") == ""
+
+    def test_empty_query_returns_empty_without_calling(self, monkeypatch):
+        def fake(*args, **kwargs):
+            raise AssertionError("run_model must not be called for an empty query")
+
+        monkeypatch.setattr(decomposition_agent, "run_model", fake)
+        assert decomposition_agent.generate_report_title("   ") == ""
+
+    def test_uses_32_tokens_and_low_effort(self, monkeypatch):
+        seen = {}
+
+        def fake(*args, **kwargs):
+            seen.update(kwargs)
+            return _FakeResponse(output_text="T")
+
+        monkeypatch.setattr(decomposition_agent, "run_model", fake)
+        decomposition_agent.generate_report_title("req")
+        assert seen["max_output_tokens"] == 32
+        assert seen["reasoning_effort"] == "low"
+        assert seen["agent_name"] == "decomposer"
