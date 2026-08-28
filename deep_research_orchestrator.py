@@ -568,7 +568,6 @@ def deep_research(
     if session_id is None:
         session_id = str(uuid4())
     budget = _LLMBudget(MAX_LLM_CALLS)
-    reset_writer_retry_budget()  # fresh truncation-retry budget for this run
     stats: Dict[str, Any] = {
         "llm_calls": 0,
         "wall_s": 0.0,
@@ -651,6 +650,10 @@ def deep_research(
 
     # Serialize deep runs (the tracked run_model swap is process-global).
     _deep_run_lock.acquire()
+    # AFTER the lock: a queued run must not re-arm the writer's shared
+    # truncation-retry budget while run 1 is still writing (reset would be
+    # an out-of-band write into a run that is in progress).
+    reset_writer_retry_budget()  # fresh truncation-retry budget for this run
     originals = _install_tracked_run_models(budget, verbose)
     try:
         # ------------------------------------------------------------------
