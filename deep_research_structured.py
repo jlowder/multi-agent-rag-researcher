@@ -104,9 +104,10 @@ def _extract_json_array(text: str) -> list | None:
     old first-"["→last-"]" slice silently returned None when prose around
     the JSON contained brackets, or when two arrays appeared.) If any
     parsed list contains str or dict items the FIRST such list (in order of
-    appearance) is returned — matching the exec-summary contract of an
-    array of paragraph strings, while tolerating dict entries; otherwise
-    the first parsed list. Lists nested inside an earlier-parsed container
+    appearance — matching the exec-summary contract of an
+    array of paragraph strings, while tolerating dict entries; when several
+    qualify the LARGEST (by decoded span) wins, so a small residue array
+    cannot steal the parse. Lists nested inside an earlier-parsed container
     are skipped. Returns None when nothing parses (soft-fail).
     """
     if not text:
@@ -133,9 +134,21 @@ def _extract_json_array(text: str) -> list | None:
             continue
         parsed.append(obj)
         spans.append((i, end))
-    for obj in parsed:
-        if any(isinstance(item, (str, dict)) for item in obj):
-            return obj
+    # Prefer the LARGEST str/dict-item list (decoded span), not the first:
+    # a small residue array may appear before the real 2-4 paragraph array
+    # and first-wins would let it dead-end the parse. A LONE single-item
+    # list is almost certainly residue (the contract is 2-4 paragraphs of
+    # ~60-120 words each): yield None so the prose fallback can rescue.
+    keyed = [
+        (obj, end - i)
+        for obj, (i, end) in zip(parsed, spans)
+        if any(isinstance(item, (str, dict)) for item in obj)
+    ]
+    if keyed:
+        best, _size = max(keyed, key=lambda pair: pair[1])
+        if len(best) == 1 and isinstance(best[0], str) and len(best[0].split()) < 30:
+            return None
+        return best
     return parsed[0] if parsed else None
 
 

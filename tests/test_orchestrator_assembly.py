@@ -535,3 +535,25 @@ def test_assemble_guards_preserve_existing_gaps_and_drop_empty_synthesis():
     md = render_markdown(rep)
     assert "### Short Area" in md and "### Long Area" in md
     assert "Synthesis" not in md
+
+
+class TestExecSummaryResidueRescue:
+    """F5: a small residue array must not dead-end the prose salvage path."""
+
+    def test_residue_array_yields_prose_rescue(self):
+        text = 'real prose para one.\nSecond para.\n["residue line"]'
+        paras = parse_exec_summary(text)
+        joined = " ".join(paras)
+        assert "residue" not in joined
+        assert "real prose para one." in joined and "Second para." in joined
+
+    def test_real_array_beats_earlier_residue(self):
+        text = (
+            '["residue line"]\n'
+            '["First real paragraph with substance.", "Second real paragraph."] '
+            'trailing'
+        )
+        assert parse_exec_summary(text) == [
+            "First real paragraph with substance.",
+            "Second real paragraph.",
+        ]
