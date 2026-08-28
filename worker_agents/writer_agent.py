@@ -1,11 +1,11 @@
 from .model_runner import run_model
-from typing import Optional
+from typing import Any, Optional
 from utils.config import get_config
 import json
 import re
 from datetime import datetime, timezone
 
-from models import Metadata, Report, Section
+from models import BlockType, Metadata, Report, ReportBlock, Section
 
 """
 Writer Agent 
@@ -153,6 +153,25 @@ def _strip_duplicate_heading(section: Section) -> None:
 def _slug(heading: str) -> str:
     """Lowercase-hyphen slug: non-alphanumeric runs collapse to one '-'."""
     return re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-")
+
+
+def _salvage_blocks(blocks: Any) -> list[ReportBlock]:
+    """Keep only block entries that individually validate as ReportBlock
+    (salvage-on-validation-failure): a single malformed block (e.g. a
+    table whose cells a weak model wrote with the wrong shape) must not
+    sink the whole section. Non-list input yields []."""
+    if not isinstance(blocks, list):
+        return []
+    kept: list[ReportBlock] = []
+    for block in blocks:
+        if isinstance(block, ReportBlock):
+            kept.append(block)
+            continue
+        try:
+            kept.append(ReportBlock.model_validate(block))
+        except Exception:
+            continue
+    return kept
 
 
 WRITE_SECTION_JSON_INSTRUCTIONS = """
@@ -593,14 +612,29 @@ def write_section(
                 obj["id"] = obj.get("id") or _slug(section_heading)
             try:
                 section = Section.model_validate(obj)
+            except Exception:
+                section = None
+            if section is None and isinstance(obj, dict):
+                salvaged = _salvage_blocks(obj.get("blocks"))
+                if salvaged:
+                    if verbose:
+                        print(
+                            f"[WRITER] WARNING: '{section_heading}' — kept "
+                            f"{len(salvaged)} of {len(obj.get('blocks') or [])} blocks "
+                            "after dropping invalid content"
+                        )
+                    section = Section(
+                        id=obj.get("id") or _slug(section_heading),
+                        heading=obj.get("heading") or section_heading,
+                        blocks=salvaged,
+                    )
+            if section is not None:
                 if not section.heading:
                     section.heading = section_heading
                 if not section.id:
                     section.id = _slug(section_heading)
                 _strip_duplicate_heading(section)
                 return section
-            except Exception:
-                pass
         if verbose:
             print(f"[WRITER] WARNING: section JSON validation failed for '{section_heading}'; returning empty section")
         return Section(id=_slug(section_heading), heading=section_heading, blocks=[])
@@ -732,14 +766,29 @@ def write_synthesis(
                 obj["id"] = obj.get("id") or "synthesis"
             try:
                 section = Section.model_validate(obj)
+            except Exception:
+                section = None
+            if section is None and isinstance(obj, dict):
+                salvaged = _salvage_blocks(obj.get("blocks"))
+                if salvaged:
+                    if verbose:
+                        print(
+                            f"[WRITER] WARNING: 'Synthesis' — kept "
+                            f"{len(salvaged)} of {len(obj.get('blocks') or [])} blocks "
+                            "after dropping invalid content"
+                        )
+                    section = Section(
+                        id=obj.get("id") or "synthesis",
+                        heading=obj.get("heading") or "Synthesis",
+                        blocks=salvaged,
+                    )
+            if section is not None:
                 if not section.heading:
                     section.heading = "Synthesis"
                 if not section.id:
                     section.id = "synthesis"
                 _strip_duplicate_heading(section)
                 return section
-            except Exception:
-                pass
         if verbose:
             print("[WRITER] WARNING: synthesis JSON validation failed; returning empty section")
         return Section(id="synthesis", heading="Synthesis", blocks=[])
