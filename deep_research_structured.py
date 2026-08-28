@@ -36,14 +36,22 @@ CONTRACT:
 
 _CITATION_KEY_RE = re.compile(r"[DW]\d+")
 
+_JSON_DECODER = json.JSONDecoder()
+
 
 def _extract_json_array(text: str) -> list | None:
     """Extract a single JSON array from a model response (best-effort).
 
     Mirror of worker_agents.writer_agent._extract_json_object for arrays:
     strip ```json/``` code fences when the whole response is fenced, then
-    take the substring from the first "[" to the last "]" and parse it.
-    Returns the parsed list, or None on any error (soft-fail).
+    raw_decode at EVERY "[" index and collect the lists that parse. (The
+    old first-"["→last-"]" slice silently returned None when prose around
+    the JSON contained brackets, or when two arrays appeared.) If any
+    parsed list contains str or dict items the FIRST such list (in order of
+    appearance) is returned — matching the exec-summary contract of an
+    array of paragraph strings, while tolerating dict entries; otherwise
+    the first parsed list. Lists nested inside an earlier-parsed container
+    are skipped. Returns None when nothing parses (soft-fail).
     """
     if not text:
         return None
@@ -51,15 +59,28 @@ def _extract_json_array(text: str) -> list | None:
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, re.DOTALL)
     if fence:
         candidate = fence.group(1).strip()
-    start = candidate.find("[")
-    end = candidate.rfind("]")
-    if start == -1 or end <= start:
-        return None
-    try:
-        obj = json.loads(candidate[start:end + 1])
-    except ValueError:
-        return None
-    return obj if isinstance(obj, list) else None
+    parsed = []
+    spans: list[tuple[int, int]] = []
+    for i, ch in enumerate(candidate):
+        if ch != "[":
+            continue
+        try:
+            obj, end = _JSON_DECODER.raw_decode(candidate, i)
+        except ValueError:
+            continue
+        if not isinstance(obj, list):
+            continue
+        # Skip arrays nested INSIDE an earlier-parsed container: when the
+        # response holds one top-level array, its inner arrays are parts of
+        # it, not competing arrays.
+        if any(start <= i < e for start, e in spans):
+            continue
+        parsed.append(obj)
+        spans.append((i, end))
+    for obj in parsed:
+        if any(isinstance(item, (str, dict)) for item in obj):
+            return obj
+    return parsed[0] if parsed else None
 
 
 def parse_exec_summary(text: str) -> list[str]:
