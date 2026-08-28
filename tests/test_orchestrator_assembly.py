@@ -327,10 +327,10 @@ def _json_section(i):
                         "spans": [
                             {"text": "First fact.", "citations": ["W1"]},
                             {"text": "Doc fact.", "citations": ["D1"]},
-                            # Past the assemble ship-guard's 30-word floor.
+                            # Past the 300-word must-revise contract floor.
                             {
                                 "text": " ".join(
-                                    f"fact{i}" for i in range(40)
+                                    f"fact{i}" for i in range(310)
                                 ),
                                 "citations": [],
                             },
@@ -351,10 +351,10 @@ def _json_section(i):
                             {"text": "Second doc fact.", "citations": ["D2"]},
                             {"text": "Invented key fact.", "citations": ["D9"]},
                             {"text": "Back to web.", "citations": ["W1"]},
-                            # Past the assemble ship-guard's 30-word floor.
+                            # Past the 300-word must-revise contract floor.
                             {
                                 "text": " ".join(
-                                    f"fact{i}" for i in range(40)
+                                    f"fact{i}" for i in range(310)
                                 ),
                                 "citations": [],
                             },

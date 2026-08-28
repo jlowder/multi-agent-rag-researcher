@@ -61,6 +61,7 @@ from utils.config import get_config
 from deep_research_structured import (
     EXEC_SUMMARY_JSON_INSTRUCTIONS,
     assemble_structured_report,
+    _content_word_count,
     parse_exec_summary,
     sections_plain_text,
 )
@@ -984,6 +985,11 @@ def deep_research(
                 for sid, _h, text in sections
                 if (isinstance(text, str) and len(text.split()) < 300)
                 or (hasattr(text, "blocks") and not text.blocks)
+                or (
+                    hasattr(text, "blocks")
+                    and text.blocks
+                    and _content_word_count(text) < 300
+                )
             }
             revision_queue: List[tuple] = []
             queued: set = set()

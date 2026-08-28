@@ -204,8 +204,8 @@ def _basic_env(critic_text: str = CRITIC_OK_JSON, writer_text=None) -> dict:
 
 def _json_writer(i: int) -> str:
     """Contract-compliant JSON section for json-mode pipeline tests: a
-    valid, non-empty Section, so the deterministic must-revise backstop
-    (which rewrites empty-Section / <300-word drafts) stays silent."""
+    valid Section with 300+ words, so the deterministic must-revise
+    backstop (which rewrites empty / <300-word sections) stays silent."""
     return json.dumps(
         {
             "id": f"section-{i + 1}",
@@ -213,7 +213,15 @@ def _json_writer(i: int) -> str:
             "blocks": [
                 {
                     "type": "paragraph",
-                    "spans": [{"text": f"Body for section {i + 1}.", "citations": []}],
+                    "spans": [
+                        {
+                            "text": "Body for section "
+                            + str(i + 1)
+                            + ". "
+                            + " ".join(f"word{j}" for j in range(310)),
+                            "citations": [],
+                        }
+                    ],
                 }
             ],
         }
@@ -1054,3 +1062,58 @@ def test_tracked_run_model_stack_reentrant():
     for m in agents:
         assert m.run_model is originals[id(m)]
         assert not dpo._run_model_stacks.get(m)
+
+
+def test_must_revise_short_json_section_even_when_critic_all_pass(monkeypatch):
+    # A NON-empty but <300-word Section (json mode) must also be queued for
+    # must-revise: the 30-word ship-guard floor is not the writer contract.
+    def writer_text(i, k):
+        if "REVISION REQUIRED" in (k.get("input_data") or ""):
+            return json.dumps(
+                {
+                    "id": f"section-{i + 1}",
+                    "heading": f"Section {i + 1}",
+                    "blocks": [
+                        {
+                            "type": "paragraph",
+                            "spans": [
+                                {
+                                    "text": "Revised substantive draft. "
+                                    + " ".join(f"fact{j}" for j in range(320)),
+                                    "citations": [],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+        return json.dumps(
+            {
+                "id": f"section-{i + 1}",
+                "heading": f"Section {i + 1}",
+                "blocks": [
+                    {
+                        "type": "paragraph",
+                        "spans": [
+                            {
+                                "text": " ".join(f"word{j}" for j in range(100)),
+                                "citations": [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+    env = _basic_env(writer_text=writer_text)
+    env["pad_writer"] = False
+    writer_calls = _install_stubs(monkeypatch, env)
+    result = dpo.deep_research("test query", verbose=False, max_rounds=3)
+
+    # Both ~100-word sections were rewritten (~320-word revisions ship).
+    revisions = [
+        c for c in writer_calls if "REVISION REQUIRED" in (c.get("input_data") or "")
+    ]
+    assert len(revisions) == 2
+    assert result["stats"]["revisions"] == 2
+    assert "Revised substantive draft." in result["final_answer"]
