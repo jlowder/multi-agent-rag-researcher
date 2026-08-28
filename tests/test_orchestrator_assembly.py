@@ -557,3 +557,65 @@ class TestExecSummaryResidueRescue:
             "First real paragraph with substance.",
             "Second real paragraph.",
         ]
+
+
+def test_short_content_section_titled_synthesis_gets_gap_notice():
+    # A chemistry section HAPPENS to be titled "Synthesis" (id is not
+    # "synthesis") — it must get the gap notice, never a silent drop.
+    short = Section(
+        id="chemistry-of-synthesis",
+        heading="Synthesis",
+        blocks=[_para([("Tiny bit.", [])])],
+    )
+    body = Section(
+        id="body",
+        heading="Body",
+        blocks=[_para([(" ".join(f"w{i}" for i in range(400)), [])])],
+    )
+    rep = assemble_structured_report(
+        sections=[short, body],
+        registry={},
+        user_query="q",
+        session_id="s1",
+        exec_paragraphs=["Ex."],
+        verification_status={},
+        title="T",
+    )
+    assert [s.heading for s in rep.report.sections] == ["Synthesis", "Body"]
+    assert "no content was generated" in rep.report.sections[0].blocks[0].spans[0].text
+    assert rep.quality.verification["gaps"] == ["not_generated: Synthesis"]
+
+
+def test_short_section_with_synthesis_id_dropped():
+    # id "synthesis" is authoritative even when a content section holds it.
+    synth = Section(
+        id="synthesis",
+        heading="Synthesis",
+        blocks=[_para([("Tiny bit.", [])])],
+    )
+    body = Section(
+        id="body",
+        heading="Body",
+        blocks=[_para([(" ".join(f"w{i}" for i in range(400)), [])])],
+    )
+    rep = assemble_structured_report(
+        sections=[body, synth],
+        registry={},
+        user_query="q",
+        session_id="s1",
+        exec_paragraphs=["Ex."],
+        verification_status={},
+        title="T",
+    )
+    assert [s.heading for s in rep.report.sections] == ["Body"]
+
+
+def test_exec_summary_citation_lead_in_line_kept():
+    # F7: a line STARTING with a short citation token is prose, not JSON
+    # residue.
+    text = "[1] shows real finding.\n\nSecond para."
+    assert parse_exec_summary(text) == ["[1] shows real finding.", "Second para."]
+    # A multi-item array of prose is a summary; a lone short item is
+    # residue (the F5 single-item rule) and still falls to salvage.
+    assert parse_exec_summary('["one line", "two line"]') == ["one line", "two line"]
+    assert parse_exec_summary('["residue line"]') == []

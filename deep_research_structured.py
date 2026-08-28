@@ -73,10 +73,16 @@ def _apply_empty_section_guards(report: ResearchReport) -> list:
     """
     keep = []
     not_generated = []
-    for section in report.report.sections:
-        is_synthesis = (
-            section.id == "synthesis"
-            or (section.heading or "").strip().casefold() == "synthesis"
+    sections = list(report.report.sections)
+    for section in sections:
+        # The writer always slugs the synthesis id to "synthesis" — that is
+        # authoritative. A heading match is a fallback for hand-built
+        # reports, but ONLY for the LAST section: a content section titled
+        # "Synthesis" (e.g. a chemistry topic) earlier in the report must
+        # get a gap notice, never a silent drop.
+        is_synthesis = section.id == "synthesis" or (
+            section is sections[-1]
+            and (section.heading or "").strip().casefold() == "synthesis"
         )
         if _content_word_count(section) < _MIN_SECTION_WORDS:
             if is_synthesis:
@@ -163,17 +169,28 @@ def parse_exec_summary(text: str) -> list[str]:
     soft-fail). Returns [] when nothing usable is present; never raises.
     """
     items = _extract_json_array(text)
-    if items is not None:
+    if items is not None and any(isinstance(p, str) and p.strip() for p in items):
         # Keep only real prose paragraphs; dict/list entries are structural
         # residue, not summary text (the contract is an array of strings).
         return [p for p in items if isinstance(p, str) and p.strip()]
+    # An array with no str items (e.g. "[1]" — a citation that happens to
+    # be valid JSON) is not a summary: fall through to the prose salvage.
     out_lines = []
     for line in (text or "").splitlines():
         s = line.strip()
-        # Residue stripping: drop lines that are themselves JSON-ish (start
-        # with { or [) or that contain a JSON array literal (a "[" followed
-        # by a quote/brace/bracket — plain citations like [1] are kept).
-        if not s or s.startswith(("{", "[")) or re.search(r"\[\s*[\"'{\[]", s):
+        # Residue stripping: drop lines that are themselves JSON-ish or that
+        # contain a JSON array literal. A leading bracket run that is a
+        # SHORT citation token (digits/letters, e.g. [1] or [W2, D3] — no
+        # quote/brace/comma inside, not empty) is prose, not residue.
+        if s.startswith("{"):
+            out_lines.append("")
+        elif s.startswith("["):
+            m = re.match(r"\[([^\[\]]{0,8})\]", s)
+            if m and re.fullmatch(r"[A-Za-z0-9]+(?:\s*,\s*[A-Za-z0-9]+)*", m.group(1).strip()):
+                out_lines.append(line)  # citation token lead-in
+            else:
+                out_lines.append("")
+        elif re.search(r"\[\s*[\"'{\[]", s):
             out_lines.append("")
         else:
             out_lines.append(line)
