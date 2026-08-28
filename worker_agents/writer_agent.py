@@ -17,13 +17,19 @@ Main role is to draft a clear, grounded response from the evidence it receives.
 
 _CITATION_KEY_RE = re.compile(r"[DW]\d+")
 
+_JSON_DECODER = json.JSONDecoder()
+
 
 def _extract_json_object(text: str) -> dict | None:
     """Extract a single JSON object from a model response (best-effort).
 
     Strips ```json/``` code fences if the whole response is fenced, then
-    takes the substring from the first "{" to the last "}" and parses it.
-    Returns the parsed dict, or None on any error (soft-fail).
+    tries to raw_decode a JSON value at EVERY "{" index and collects the
+    dicts that parse. (The old first-"{"→last-"}" slice silently returned
+    None when prose around the JSON contained braces, or when two objects
+    appeared.) If any parsed dict contains a "blocks" or "heading" key the
+    FIRST such dict (in order of appearance) is returned; otherwise the
+    first parsed dict. Returns None when nothing parses (soft-fail).
     """
     if not text:
         return None
@@ -31,15 +37,20 @@ def _extract_json_object(text: str) -> dict | None:
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, re.DOTALL)
     if fence:
         candidate = fence.group(1).strip()
-    start = candidate.find("{")
-    end = candidate.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        obj = json.loads(candidate[start:end + 1])
-    except ValueError:
-        return None
-    return obj if isinstance(obj, dict) else None
+    parsed = []
+    for i, ch in enumerate(candidate):
+        if ch != "{":
+            continue
+        try:
+            obj, _end = _JSON_DECODER.raw_decode(candidate, i)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            parsed.append(obj)
+    for obj in parsed:
+        if "blocks" in obj or "heading" in obj:
+            return obj
+    return parsed[0] if parsed else None
 
 
 def _slug(heading: str) -> str:
