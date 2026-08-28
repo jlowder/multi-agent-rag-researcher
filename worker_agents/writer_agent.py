@@ -676,11 +676,22 @@ def write_section(
                             f"{len(salvaged)} of {len(obj.get('blocks') or [])} blocks "
                             "after dropping invalid content"
                         )
-                    section = Section(
-                        id=obj.get("id") or _slug(section_heading),
-                        heading=obj.get("heading") or section_heading,
-                        blocks=salvaged,
-                    )
+                    try:
+                        section = Section(
+                            id=obj.get("id") or _slug(section_heading),
+                            heading=obj.get("heading") or section_heading,
+                            blocks=salvaged,
+                        )
+                    except Exception:
+                        # Wrong-typed heading/id (e.g. 123) would raise out
+                        # of the function; never-raise contract wins — fall
+                        # through to the soft-fail empty section below.
+                        section = None
+                        if verbose:
+                            print(
+                                f"[WRITER] WARNING: '{section_heading}' — "
+                                "salvage construction failed; returning empty section"
+                            )
             if section is not None:
                 if obj_end >= 0:
                     recovered = _recover_trailing_blocks(text, obj_end)
@@ -840,11 +851,22 @@ def write_synthesis(
                             f"{len(salvaged)} of {len(obj.get('blocks') or [])} blocks "
                             "after dropping invalid content"
                         )
-                    section = Section(
-                        id=obj.get("id") or "synthesis",
-                        heading=obj.get("heading") or "Synthesis",
-                        blocks=salvaged,
-                    )
+                    try:
+                        section = Section(
+                            id=obj.get("id") or "synthesis",
+                            heading=obj.get("heading") or "Synthesis",
+                            blocks=salvaged,
+                        )
+                    except Exception:
+                        # Wrong-typed heading/id (e.g. 123) would raise out
+                        # of the function; never-raise contract wins — fall
+                        # through to the soft-fail empty section below.
+                        section = None
+                        if verbose:
+                            print(
+                                "[WRITER] WARNING: 'Synthesis' — salvage "
+                                "construction failed; returning empty section"
+                            )
             if section is not None:
                 if obj_end >= 0:
                     recovered = _recover_trailing_blocks(text, obj_end)
