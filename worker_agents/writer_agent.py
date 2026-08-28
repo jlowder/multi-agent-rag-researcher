@@ -549,6 +549,11 @@ def write_section(
             text = (response.output_text or "").strip()
             obj = _extract_json_object(text)
         if obj is not None:
+            # Repair-before-validate: a single missing/None heading or id
+            # must not kill an otherwise complete section.
+            if isinstance(obj, dict):
+                obj["heading"] = obj.get("heading") or section_heading
+                obj["id"] = obj.get("id") or _slug(section_heading)
             try:
                 section = Section.model_validate(obj)
                 if not section.heading:
@@ -682,6 +687,11 @@ def write_synthesis(
             text = (response.output_text or "").strip()
             obj = _extract_json_object(text)
         if obj is not None:
+            # Repair-before-validate: a single missing/None heading or id
+            # must not kill an otherwise complete section.
+            if isinstance(obj, dict):
+                obj["heading"] = obj.get("heading") or "Synthesis"
+                obj["id"] = obj.get("id") or "synthesis"
             try:
                 section = Section.model_validate(obj)
                 if not section.heading:
