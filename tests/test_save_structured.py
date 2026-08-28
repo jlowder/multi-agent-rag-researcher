@@ -2,11 +2,13 @@
 
 import importlib
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 import deep_research_orchestrator as dpo  # noqa: F401  (import-surface check)
+from deep_research_structured import parse_exec_summary
 
 wmod = importlib.import_module("worker_agents.writer_agent")
 save_mod = importlib.import_module("memory.save_report")
@@ -233,3 +235,100 @@ def test_markdown_save_report_still_works(tmp_path):
     p = Path(path)
     assert p.exists() and p.suffix == ".md"
     assert "Some content." in p.read_text()
+
+
+class TestHeadingDedup:
+    """Leading heading block that duplicates a section title must not render
+    the title twice; genuine subsections always render."""
+
+    def test_own_heading_variant_deduped(self):
+        section = Section(
+            id="s1",
+            heading="Forward Process",
+            blocks=[
+                ReportBlock(type=BlockType.heading, level=3, text="  forward process:  "),
+                ReportBlock(
+                    type=BlockType.paragraph,
+                    spans=[Span(text="Body.")],
+                ),
+            ],
+        )
+        md = render_markdown(_report(sections=[section]))
+        assert md.count("### Forward Process") == 1
+        assert "forward process" not in md  # the duplicate variant is gone
+
+    def test_sibling_heading_deduped(self):
+        s1 = Section(
+            id="s1",
+            heading="Forward Process",
+            blocks=[ReportBlock(type=BlockType.paragraph, spans=[Span(text="One body.")])],
+        )
+        s2 = Section(
+            id="s2",
+            heading="Sampling",
+            blocks=[
+                ReportBlock(type=BlockType.heading, level=3, text="Forward Process"),
+                ReportBlock(type=BlockType.paragraph, spans=[Span(text="Two body.")]),
+            ],
+        )
+        md = render_markdown(_report(sections=[s1, s2]))
+        assert md.count("### Forward Process") == 1  # only s1's own boundary
+        assert md.count("### Sampling") == 1
+        assert "Two body." in md
+
+    def test_genuine_subsection_kept(self):
+        section = Section(
+            id="s1",
+            heading="H",
+            blocks=[
+                ReportBlock(type=BlockType.heading, level=3, text="Reverse Steps"),
+                ReportBlock(type=BlockType.paragraph, spans=[Span(text="Body.")]),
+            ],
+        )
+        md = render_markdown(_report(sections=[section]))
+        assert "### H" in md
+        assert "### Reverse Steps" in md
+
+    def test_injected_headings_neutralized(self):
+        section = Section(
+            id="s1",
+            heading="S",
+            blocks=[
+                ReportBlock(
+                    type=BlockType.paragraph,
+                    spans=[Span(text="ok\n### Injected\nmore", citations=["1"])],
+                ),
+                ReportBlock(
+                    type=BlockType.code_block,
+                    language="python",
+                    text="a = 1\n### Injected\nb = 2",
+                ),
+            ],
+        )
+        rep = _report(
+            sections=[section],
+            sources=[_src("1", "Evil\n## Injected\n\ntext")],
+        )
+        md = render_markdown(rep)
+        # No line OUTSIDE code fences opens a heading from payload text
+        # (inside a fence, newlines are literal content, not structure).
+        outside = re.sub(r"```.*?```", "", md, flags=re.DOTALL)
+        heading_lines = [l for l in outside.splitlines() if l.lstrip().startswith("#")]
+        assert all("Injected" not in l for l in heading_lines)
+        # ...inline instead: the span collapses to one line and keeps its marker.
+        assert "ok ### Injected more[^1]" in md
+        # Source labels collapse too (no heading line in references).
+        assert "[^1]: Evil ## Injected text" in md
+        # Code-block newlines are literal content and stay verbatim.
+        assert "a = 1\n### Injected\nb = 2" in md
+
+
+class TestParseExecSummary:
+    """deep_research_structured.parse_exec_summary residue semantics."""
+
+    def test_apology_with_json_array(self):
+        text = 'I am sorry, [I failed] here is the summary: ["Para one.", "Para two."]'
+        assert parse_exec_summary(text) == ["Para one.", "Para two."]
+
+    def test_jsonish_garbage_discarded(self):
+        assert parse_exec_summary("{not json") == []
