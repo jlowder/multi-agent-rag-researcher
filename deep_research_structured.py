@@ -87,14 +87,28 @@ def parse_exec_summary(text: str) -> list[str]:
     """Parse an executive-summary model response into prose paragraphs.
 
     Prefers a JSON array of strings (contract per
-    EXEC_SUMMARY_JSON_INSTRUCTIONS). On any parse failure, salvages the
-    raw text as blank-line-separated paragraphs (plan soft-fail). Returns
-    [] when nothing usable is present; never raises.
+    EXEC_SUMMARY_JSON_INSTRUCTIONS), keeping only str items. On any parse
+    failure, salvages the raw text as blank-line-separated paragraphs,
+    stripping JSON residue (lines that are JSON-ish or contain a JSON array
+    literal — apologies + raw JSON must not ship as the summary; plan
+    soft-fail). Returns [] when nothing usable is present; never raises.
     """
     items = _extract_json_array(text)
     if items is not None:
-        return [str(p) for p in items if str(p).strip()]
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+        # Keep only real prose paragraphs; dict/list entries are structural
+        # residue, not summary text (the contract is an array of strings).
+        return [p for p in items if isinstance(p, str) and p.strip()]
+    out_lines = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        # Residue stripping: drop lines that are themselves JSON-ish (start
+        # with { or [) or that contain a JSON array literal (a "[" followed
+        # by a quote/brace/bracket — plain citations like [1] are kept).
+        if not s or s.startswith(("{", "[")) or re.search(r"\[\s*[\"'{\[]", s):
+            out_lines.append("")
+        else:
+            out_lines.append(line)
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", "\n".join(out_lines)) if p.strip()]
     return paragraphs
 
 

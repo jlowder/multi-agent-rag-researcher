@@ -230,7 +230,9 @@ class TestParseExecSummary:
         ]
 
     def test_garbage_never_raises(self):
-        assert parse_exec_summary("{not json")  # list, no exception
+        # JSON-ish residue (starts with { or [) is stripped, not salvaged:
+        # an apology + raw JSON must not ship as the executive summary.
+        assert parse_exec_summary("{not json") == []
         assert parse_exec_summary("") == []
 
 
