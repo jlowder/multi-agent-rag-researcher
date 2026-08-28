@@ -1194,7 +1194,8 @@ def save_structured_report(
 ) -> str:
     """Save a validated structured report to reports/ (plan section 7.1).
 
-    Writes, all sharing the stem {safe_query}_{timestamp}:
+    Writes, all sharing the stem {stem_base}_{timestamp} (stem_base from the
+    LLM report title when usable, else the sanitized query):
     - {stem}.json         — the canonical structured document
     - {stem}.sources.json — standalone sources array (for the doc-gen project)
     - {stem}.markdown.md  — deterministic Markdown export (render_markdown)
@@ -1226,11 +1227,16 @@ def save_structured_report(
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = config or ReportConfig.default()
-    _valid, safe_query = _validate_query(report.report.metadata.query or "")
-    if not safe_query:
-        safe_query = "untitled"
+    title = (report.report.metadata.title or "").strip()
+    stem_base = _name_to_stem(title) if title else ""
+    if not stem_base:
+        # No usable LLM title: existing query-based fallback (untitled etc.).
+        _valid, safe_query = _validate_query(report.report.metadata.query or "")
+        if not safe_query:
+            safe_query = "untitled"
+        stem_base = safe_query
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem = f"{safe_query}_{timestamp}"
+    stem = f"{stem_base}_{timestamp}"
 
     json_path = reports_dir / f"{stem}.json"
     sources_path = reports_dir / f"{stem}.sources.json"
