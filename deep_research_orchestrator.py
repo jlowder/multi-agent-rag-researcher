@@ -51,7 +51,11 @@ from worker_agents.decomposition_agent import decompose_query
 from worker_agents.model_runner import run_model
 from worker_agents.retriever_agent import retriever_agent
 from worker_agents.verifier_agent import verification_critic
-from worker_agents.writer_agent import write_section, write_synthesis
+from worker_agents.writer_agent import (
+    reset_writer_retry_budget,
+    write_section,
+    write_synthesis,
+)
 from utils.config import get_config
 from deep_research_structured import (
     EXEC_SUMMARY_JSON_INSTRUCTIONS,
@@ -539,6 +543,7 @@ def deep_research(
     if session_id is None:
         session_id = str(uuid4())
     budget = _LLMBudget(MAX_LLM_CALLS)
+    reset_writer_retry_budget()  # fresh truncation-retry budget for this run
     stats: Dict[str, Any] = {
         "llm_calls": 0,
         "wall_s": 0.0,
