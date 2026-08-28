@@ -305,10 +305,11 @@ CONTRACT — all of these are mandatory:
    heading {"type":"heading","level":3,"text":"..."}
    unordered_list/ordered_list {"type":"...","items":[{"text":"...","citations":[...]}]}
    callout {"type":"callout","callout_type":"note|warning|info","spans":[...]}
-   comparison_table {"type":"comparison_table","caption":"...","columns":[...],"rows":[[...]]}
+   comparison_table {"type":"comparison_table","caption":"...","columns":["A","B"],"rows":[[{"text":"cell","citations":["D1"]},{"text":"cell2","citations":[]}]]}
    code_block {"type":"code_block","language":"...","text":"..."}
    page_break {"type":"page_break"}
    citation_note {"type":"citation_note","spans":[...]}
+   Table cells and list items must be span objects, never bare strings.
 8. Per-sentence spans: split each paragraph into spans so the span that ends
    a cited sentence carries that sentence's citation keys; uncited
    transition spans get citations []. Use at least 2 blocks.
@@ -344,10 +345,11 @@ CONTRACT — all of these are mandatory:
    heading {"type":"heading","level":3,"text":"..."}
    unordered_list/ordered_list {"type":"...","items":[{"text":"...","citations":[...]}]}
    callout {"type":"callout","callout_type":"note|warning|info","spans":[...]}
-   comparison_table {"type":"comparison_table","caption":"...","columns":[...],"rows":[[...]]}
+   comparison_table {"type":"comparison_table","caption":"...","columns":["A","B"],"rows":[[{"text":"cell","citations":["D1"]},{"text":"cell2","citations":[]}]]}
    code_block {"type":"code_block","language":"...","text":"..."}
    page_break {"type":"page_break"}
    citation_note {"type":"citation_note","spans":[...]}
+   Table cells and list items must be span objects, never bare strings.
 5. Per-sentence spans: split each paragraph into spans so the span that ends
    a cited sentence carries that sentence's citation keys; uncited
    transition spans get citations [].
