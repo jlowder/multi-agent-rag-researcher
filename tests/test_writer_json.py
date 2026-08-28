@@ -567,3 +567,26 @@ def test_trailing_prose_is_ignored(monkeypatch):
     section, _ = _write_section(monkeypatch, text)
     assert len(section.blocks) == 1
     assert section.blocks[0].spans[0].text == "only block"
+
+
+def test_wrong_typed_id_soft_fails_instead_of_raising(monkeypatch):
+    # id is a truthy wrong-typed value (123): whole-object validation fails
+    # AND the salvage Section construction would raise; the never-raise
+    # contract requires falling through to the empty soft-fail section.
+    text = json.dumps(
+        {
+            "id": 123,
+            "heading": "Market",
+            "blocks": [
+                {
+                    "type": "paragraph",
+                    "spans": [{"text": "good words here", "citations": ["D1"]}],
+                },
+                {"type": "nonsense"},
+            ],
+        }
+    )
+    section, _ = _write_section(monkeypatch, text)
+    assert section.blocks == []
+    assert section.heading == "Market"
+    assert section.id == "market"
