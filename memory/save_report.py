@@ -300,6 +300,42 @@ def _validate_query(query: str) -> Tuple[bool, str]:
     return True, safe
 
 
+_SAFE_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
+
+
+def _name_to_stem(name: str) -> str:
+    """Convert an LLM-generated report title into a safe filename stem base.
+
+    Lowercases, replaces every char that is not [a-z0-9] with '_', collapses
+    runs of '_', strips leading/trailing '_', then caps at 60 chars on a
+    word boundary: tokens are joined until the running length would exceed
+    60 and any trailing partial token is dropped (so names like
+    'genetic_programming_report' never end mid-word). Returns '' when
+    nothing usable remains — callers fall back to the query-based logic.
+    """
+    if not name:
+        return ""
+    s = "".join(c if c in _SAFE_NAME_CHARS else "_" for c in name.strip().lower())
+    s = re.sub(r"_{2,}", "_", s).strip("_")
+    if not s:
+        return ""
+    tokens = s.split("_")
+    out: list[str] = []
+    length = 0
+    for tok in tokens:
+        if not out:
+            if len(tok) > 60:
+                break
+            out.append(tok)
+            length = len(tok)
+        else:
+            if length + 1 + len(tok) > 60:
+                break
+            out.append(tok)
+            length += 1 + len(tok)
+    return "_".join(out)
+
+
 def _parse_evidence_json(evidence_json: str) -> Tuple[List[EvidenceChunk], List[WebResult]]:
     """Parse evidence JSON string into structured data.
     
