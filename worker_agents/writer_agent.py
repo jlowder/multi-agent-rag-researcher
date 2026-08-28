@@ -163,7 +163,8 @@ You are writing ONE section of a deep-research report. You will be given:
 CONTRACT — all of these are mandatory:
 1. Write at least 300 words of substance: concrete facts, mechanisms,
    comparisons, and examples grounded in the evidence for THIS section —
-   not filler.
+   not filler. Keep the section between about 300 and 1100 words of
+   substance.
 2. Cite every factual sentence with a key that is ACTUALLY PROVIDED in the
    evidence for this section: every factual sentence is one containing a
    claim, name, number, date, or specific finding. Density target for this
@@ -190,6 +191,9 @@ CONTRACT — all of these are mandatory:
    a cited sentence carries that sentence's citation keys; uncited
    transition spans get citations [].
 6. Use at least 2 blocks per section (a subsection heading is encouraged).
+   Do NOT include the section's own title as a heading block — the title is
+   carried by the `heading` field. Include subsection heading blocks only
+   for subsections you actually write.
 
 Example of one paragraph block with per-sentence citation spans:
 {"type":"paragraph","spans":[{"text":"Grid-scale deployment rose sharply","citations":[]},{"text":"in several major electricity markets","citations":["D1","W2"]},{"text":"through 2024","citations":["D1"]}]}
