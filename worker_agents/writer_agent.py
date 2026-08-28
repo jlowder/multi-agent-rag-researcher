@@ -27,9 +27,11 @@ def _extract_json_object(text: str) -> dict | None:
     tries to raw_decode a JSON value at EVERY "{" index and collects the
     dicts that parse. (The old first-"{"→last-"}" slice silently returned
     None when prose around the JSON contained braces, or when two objects
-    appeared.) If any parsed dict contains a "blocks" or "heading" key the
-    FIRST such dict (in order of appearance) is returned; otherwise the
-    first parsed dict. Returns None when nothing parses (soft-fail).
+    appeared.) When any parsed dict contains a "blocks" or "heading" key
+    the LARGEST such dict (by decoded span) is returned — a prose decoy
+    like `example: {"heading": "wrong"}` may precede the real section —
+    otherwise the first parsed dict. Returns None when nothing parses
+    (soft-fail).
     """
     if not text:
         return None
@@ -56,9 +58,12 @@ def _extract_json_object(text: str) -> dict | None:
             continue
         parsed.append(obj)
         spans.append((i, end))
-    for obj in parsed:
-        if "blocks" in obj or "heading" in obj:
-            return obj
+    # Prefer the LARGEST key-bearing dict (decoded span), not the first:
+    # a prose decoy like `example: {"heading": "wrong"}` may appear before
+    # the real section, and first-wins would let it steal the response.
+    keyed = [ (obj, end - i) for (obj, (i, end)) in zip(parsed, spans) if "blocks" in obj or "heading" in obj ]
+    if keyed:
+        return max(keyed, key=lambda pair: pair[1])[0]
     return parsed[0] if parsed else None
 
 

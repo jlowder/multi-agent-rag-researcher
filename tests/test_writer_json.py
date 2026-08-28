@@ -9,6 +9,7 @@ no LLM calls.
 """
 
 import importlib
+import json
 import re
 
 import pytest
@@ -445,3 +446,26 @@ def test_different_first_subsection_heading_kept(monkeypatch):
     assert len(section.blocks) == 2
     assert section.blocks[0].type == "heading"
     assert section.blocks[0].text == "Sub Section"
+
+
+def test_extract_prefers_largest_keyed_dict_over_prose_decoy():
+    real = json.dumps(
+        {
+            "id": "market",
+            "heading": "Market",
+            "blocks": [
+                {"type": "paragraph", "spans": [{"text": "x" * 400, "citations": []}]}
+            ],
+        }
+    )
+    # A tiny decoy with a preferred key appears BEFORE the real section.
+    text = 'Here is an example: {"heading": "wrong"}\n' + real
+    assert wmod._extract_json_object(text) == json.loads(real)
+    # Array-wrapped decoy (its dict is nested, so not a competing object;
+    # the real section still wins on size).
+    text2 = 'note: [{"heading": "decoy"}]\n' + real
+    assert wmod._extract_json_object(text2) == json.loads(real)
+    # Two real candidates: the bigger one wins.
+    small = '{"id": "a", "heading": "A", "blocks": []}'
+    text3 = small + "\n" + real
+    assert wmod._extract_json_object(text3)["id"] == "market"
