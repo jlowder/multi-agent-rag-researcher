@@ -20,8 +20,9 @@ _CITATION_KEY_RE = re.compile(r"[DW]\d+")
 _JSON_DECODER = json.JSONDecoder()
 
 
-def _extract_json_object(text: str) -> dict | None:
-    """Extract a single JSON object from a model response (best-effort).
+def _extract_json_object_span(text: str) -> tuple[dict | None, int]:
+    """Extract a single JSON object from a model response (best-effort),
+    returning (object, end-offset).
 
     Strips ```json/``` code fences if the whole response is fenced, then
     tries to raw_decode a JSON value at EVERY "{" index and collects the
@@ -30,16 +31,18 @@ def _extract_json_object(text: str) -> dict | None:
     appeared.) When any parsed dict contains a "blocks" or "heading" key
     the LARGEST such dict (by decoded span) is returned — a prose decoy
     like `example: {"heading": "wrong"}` may precede the real section —
-    otherwise the first parsed dict. Returns None when nothing parses
-    (soft-fail).
+    otherwise the first parsed dict. Returns (None, -1) when nothing
+    parses (soft-fail). The end offset is the position in the stripped
+    (de-fenced) text where the chosen object's decode ended, for
+    post-object premature-close recovery.
     """
     if not text:
-        return None
+        return None, -1
     candidate = text.strip()
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, re.DOTALL)
     if fence:
         candidate = fence.group(1).strip()
-    parsed = []
+    parsed: list[tuple[dict, int, int]] = []
     spans: list[tuple[int, int]] = []
     for i, ch in enumerate(candidate):
         if ch != "{":
@@ -56,15 +59,64 @@ def _extract_json_object(text: str) -> dict | None:
         # not be preferred over the report itself).
         if any(start <= i < e for start, e in spans):
             continue
-        parsed.append(obj)
+        parsed.append((obj, i, end))
         spans.append((i, end))
+    if not parsed:
+        return None, -1
     # Prefer the LARGEST key-bearing dict (decoded span), not the first:
     # a prose decoy like `example: {"heading": "wrong"}` may appear before
     # the real section, and first-wins would let it steal the response.
-    keyed = [ (obj, end - i) for (obj, (i, end)) in zip(parsed, spans) if "blocks" in obj or "heading" in obj ]
+    keyed = [p for p in parsed if "blocks" in p[0] or "heading" in p[0]]
     if keyed:
-        return max(keyed, key=lambda pair: pair[1])[0]
-    return parsed[0] if parsed else None
+        obj, _start, end = max(keyed, key=lambda p: p[2] - p[1])
+    else:
+        obj, _start, end = parsed[0]
+    return obj, end
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Extract a single JSON object from a model response (best-effort).
+    Same selection rules as _extract_json_object_span; returns the parsed
+    dict, or None when nothing parses (soft-fail)."""
+    return _extract_json_object_span(text)[0]
+
+
+_BLOCK_VOCAB = frozenset(t.value for t in BlockType)
+_MAX_RECOVERED_BLOCKS = 20
+
+
+def _recover_trailing_blocks(text: str, end: int) -> list[ReportBlock]:
+    """Premature-close recovery: some models close the section object early
+    and keep writing the remaining blocks as trailing JSON. Scan `text[end:]`
+    (raw_decode at every '{') and keep complete objects whose "type" is a
+    block-vocabulary value and which validate as ReportBlock (the lenient
+    string-cell coercion applies; invalids are skipped). Ignored entirely
+    when the remainder is insignificant (<200 non-ws chars and no '{').
+    Capped at _MAX_RECOVERED_BLOCKS blocks."""
+    if end < 0:
+        return []
+    remainder = text[end:]
+    if len(remainder.strip()) < 200 and "{" not in remainder:
+        return []
+    out: list[ReportBlock] = []
+    spans: list[tuple[int, int]] = []
+    for i, ch in enumerate(remainder):
+        if ch != "{" or len(out) >= _MAX_RECOVERED_BLOCKS:
+            continue
+        try:
+            obj, b_end = _JSON_DECODER.raw_decode(remainder, i)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") not in _BLOCK_VOCAB:
+            continue
+        if any(start <= i < e for start, e in spans):
+            continue
+        try:
+            out.append(ReportBlock.model_validate(obj))
+        except Exception:
+            continue
+        spans.append((i, b_end))
+    return out
 
 
 def _is_truncated_response(response) -> bool:
@@ -581,7 +633,7 @@ def write_section(
     text = (response.output_text or "").strip()
 
     if output_format == "json":
-        obj = _extract_json_object(text)
+        obj, obj_end = _extract_json_object_span(text)
         if (
             obj is None
             and (_is_truncated_response(response) or _looks_truncated_json(text))
@@ -603,7 +655,7 @@ def write_section(
                 api_key=api_key,
             )
             text = (response.output_text or "").strip()
-            obj = _extract_json_object(text)
+            obj, obj_end = _extract_json_object_span(text)
         if obj is not None:
             # Repair-before-validate: a single missing/None heading or id
             # must not kill an otherwise complete section.
@@ -629,6 +681,16 @@ def write_section(
                         blocks=salvaged,
                     )
             if section is not None:
+                if obj_end >= 0:
+                    recovered = _recover_trailing_blocks(text, obj_end)
+                    if recovered:
+                        if verbose:
+                            print(
+                                f"[WRITER] WARNING: '{section_heading}' — "
+                                f"recovered {len(recovered)} block(s) written "
+                                "past the section object's premature close"
+                            )
+                        section.blocks.extend(recovered)
                 if not section.heading:
                     section.heading = section_heading
                 if not section.id:
@@ -735,7 +797,7 @@ def write_synthesis(
     text = (response.output_text or "").strip()
 
     if output_format == "json":
-        obj = _extract_json_object(text)
+        obj, obj_end = _extract_json_object_span(text)
         if (
             obj is None
             and (_is_truncated_response(response) or _looks_truncated_json(text))
@@ -757,7 +819,7 @@ def write_synthesis(
                 api_key=api_key,
             )
             text = (response.output_text or "").strip()
-            obj = _extract_json_object(text)
+            obj, obj_end = _extract_json_object_span(text)
         if obj is not None:
             # Repair-before-validate: a single missing/None heading or id
             # must not kill an otherwise complete section.
@@ -783,6 +845,16 @@ def write_synthesis(
                         blocks=salvaged,
                     )
             if section is not None:
+                if obj_end >= 0:
+                    recovered = _recover_trailing_blocks(text, obj_end)
+                    if recovered:
+                        if verbose:
+                            print(
+                                f"[WRITER] WARNING: 'Synthesis' — "
+                                f"recovered {len(recovered)} block(s) written "
+                                "past the section object's premature close"
+                            )
+                        section.blocks.extend(recovered)
                 if not section.heading:
                     section.heading = "Synthesis"
                 if not section.id:
