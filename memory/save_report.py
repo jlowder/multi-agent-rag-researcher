@@ -646,7 +646,8 @@ def save_report(
     session_id: str = "default",
     state: Optional[JsonDict] = None,
     output_dir: Optional[Path] = None,
-    config: Optional[ReportConfig] = None
+    config: Optional[ReportConfig] = None,
+    title: str = "",
 ) -> str:
     """Save a research report to a markdown file with comprehensive structure.
 
@@ -662,6 +663,8 @@ def save_report(
                evidence and other metadata for enriched reporting.
         output_dir: Optional custom output directory. Defaults to reports/ directory.
         config: Optional configuration for report generation.
+        title: Optional LLM-generated report title. When non-empty it is
+               preferred over the query for filename generation.
         
     Returns:
         The absolute file path where the report was saved.
@@ -699,9 +702,15 @@ def save_report(
     if not safe_query:
         safe_query = "untitled"
     
+    # An LLM-generated title (when provided and usable) names the file
+    # instead of the raw query.
+    stem_base = _name_to_stem(title) if title else ""
+    if not stem_base:
+        stem_base = safe_query
+    
     # Generate timestamp and filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{safe_query}_{timestamp}.md"
+    filename = f"{stem_base}_{timestamp}.md"
     filepath = reports_dir / filename
     
     cfg = config or ReportConfig.default()
