@@ -44,11 +44,16 @@ class ResearchEvidencePack(BaseModel):
 _CHUNK_CONTENT_MAX_CHARS = 800
 
 
+# None means "use the configured DOC_SCORE_THRESHOLD" (utils/config.py,
+# default 0.2 — the only relevance floor on qdrant hits). Callers can still
+# pass an explicit value to override the config for one call.
 def retrieve_document(
     query: str,
     per_doc_topk: int = 8,
-    score_threshold: Optional[float] = 0.2,
+    score_threshold: Optional[float] = None,
 ) -> Dict[str, Any]:
+    if score_threshold is None:
+        score_threshold = get_config().doc_score_threshold
     try:
         results = similarity_search(
             query=query,
