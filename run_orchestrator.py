@@ -7,13 +7,23 @@ from pathlib import Path
 from typing import Dict, Any
 
 from memory import init_memory, set_debug_mode
+from memory.evidence_cache import clear_evidence_cache
 from memory.save_report import save_report, ReportConfig, build_enriched_markdown
 from orchestrator_agent import orchestrator_agent
 from deep_research_orchestrator import deep_research
-from qdrant_vector_database import close_qdrant_client, ingest_documents
+from qdrant_vector_database import close_qdrant_client, ingest_documents, reconcile_corpus
 
 def initialize_app(pdf_dir: Path) -> dict:
     init_memory()
+    # Drop corpus entries for PDFs deleted since the last ingest (and the
+    # evidence packs built on them) before re-ingesting. Never blocks
+    # startup: a reconcile failure just leaves the old corpus in place.
+    try:
+        vanished = reconcile_corpus(pdf_dir)
+        if vanished:
+            clear_evidence_cache()
+    except Exception as exc:
+        print(f"WARNING: corpus reconcile failed: {type(exc).__name__}: {exc}")
     print("Ingesting documents...")
     info = ingest_documents(pdf_dir)
     print(
