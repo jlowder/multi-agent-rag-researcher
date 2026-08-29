@@ -4,6 +4,7 @@ Configuration module for multi-agent RAG researcher.
 Supports OpenAI and local LLMs with OpenAI-compatible endpoints.
 """
 
+import math
 import os
 import logging
 import re
@@ -212,9 +213,13 @@ def get_config() -> Config:
             evidence_cache_ttl_days = 30
 
         # Safe-float: a bad DOC_SCORE_THRESHOLD must not crash config
-        # loading app-wide (falls back to the 0.2 default).
+        # loading app-wide (falls back to the 0.2 default). Non-finite
+        # values ("nan", "inf") parse fine as floats but are unusable as a
+        # relevance floor, so they are treated as invalid too.
         try:
             doc_score_threshold = float(os.getenv("DOC_SCORE_THRESHOLD", "0.2"))
+            if not math.isfinite(doc_score_threshold):
+                raise ValueError(f"non-finite: {doc_score_threshold!r}")
         except (TypeError, ValueError):
             logger = logging.getLogger(__name__)
             logger.warning(

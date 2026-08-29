@@ -12,6 +12,8 @@ import types
 # monkeypatch its internals (similarity_search / get_config).
 ra = importlib.import_module("worker_agents.retriever_agent")
 
+import utils.config as config_mod
+
 
 def _fake_config(threshold: float):
     return types.SimpleNamespace(doc_score_threshold=threshold)
@@ -68,3 +70,28 @@ def test_retrieve_document_explicit_threshold_wins_over_config(
 
     ra.retrieve_document("some query", score_threshold=0.5)
     assert calls["score_threshold"] == 0.5
+
+
+class TestDocScoreThresholdEnvParsing:
+    def setup_method(self):
+        config_mod.reset_config()
+
+    def teardown_method(self):
+        config_mod.reset_config()
+
+    def test_non_finite_env_value_falls_back_to_default(
+        self, monkeypatch
+    ):
+        # "1e309" parses as float inf; nan would too. Both must be rejected.
+        monkeypatch.setenv("DOC_SCORE_THRESHOLD", "1e309")
+        assert config_mod.get_config().doc_score_threshold == 0.2
+        monkeypatch.setenv("DOC_SCORE_THRESHOLD", "nan")
+        assert config_mod.get_config().doc_score_threshold == 0.2
+
+    def test_valid_env_value_is_used(self, monkeypatch):
+        monkeypatch.setenv("DOC_SCORE_THRESHOLD", "0.6")
+        assert config_mod.get_config().doc_score_threshold == 0.6
+
+    def test_unset_env_value_is_default(self, monkeypatch):
+        monkeypatch.delenv("DOC_SCORE_THRESHOLD", raising=False)
+        assert config_mod.get_config().doc_score_threshold == 0.2
