@@ -346,3 +346,46 @@ def decompose_query(
             f"sub_questions={len(plan.get('sub_questions', []))}"
         )
     return plan
+
+
+def generate_report_title(
+    query: str,
+    endpoint: Optional[str] = None,
+    api_key: Optional[str] = None,
+    verbose: bool = False,
+    model: Optional[str] = None,
+) -> str:
+    """Generate a short report title for standard (non-deep) runs.
+
+    ONE plain run_model call on the decomposer's configured model
+    (32 tokens, low reasoning). Returns the stripped title, or "" on
+    ANY exception or empty result — never raises; callers fall back to
+    the query-based filename.
+    """
+    q = (query or "").strip()
+    if not q:
+        return ""
+    prompt = (
+        "Summarize this research request as a short report title: 3-6 words, "
+        "Title Case, no quotation marks, no trailing punctuation, output the "
+        f"title only.\nRequest: {q}"
+    )
+    try:
+        response = run_model(
+            instructions="You write concise report titles.",
+            input_data=prompt,
+            reasoning_effort="low",
+            max_output_tokens=32,
+            agent_name="decomposer",
+            model=model,
+            endpoint=endpoint,
+            api_key=api_key,
+        )
+    except Exception as exc:
+        if verbose:
+            print(f"[TITLE] generation failed: {type(exc).__name__}: {exc}")
+        return ""
+    title = (getattr(response, "output_text", None) or "").strip().strip("'\"").strip()
+    if verbose:
+        print(f"[TITLE] {title or '(empty)'}")
+    return title

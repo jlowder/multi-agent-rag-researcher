@@ -352,3 +352,35 @@ def test_citation_token_newline_collapse():
     assert "Fact.[^1]" in md
     assert "[^1]: Source One" in md
     assert "[^1\n" not in md
+
+
+def _retitled(rep, title: str, query: str):
+    meta = rep.report.metadata.model_copy(update={"title": title, "query": query})
+    rep.report = rep.report.model_copy(update={"metadata": meta})
+    return rep
+
+
+class TestSaveStructuredNaming:
+    def test_title_names_all_artifacts(self, tmp_path):
+        rep = _retitled(
+            _report(),
+            title="Comprehensive Report on Genetic Programming",
+            query="Produce a comprehensive report on Genetic Programming and its successes",
+        )
+        returned = Path(save_structured_report(rep, output_dir=tmp_path))
+        base = "comprehensive_report_on_genetic_programming"
+        stem = returned.stem
+        assert stem.startswith(base + "_")
+        for p in tmp_path.iterdir():
+            assert p.name.startswith(base + "_"), p.name
+        assert {p.suffix for p in tmp_path.iterdir()} <= {".json", ".md"}
+
+    def test_missing_title_falls_back_to_query(self, tmp_path):
+        rep = _retitled(_report(), title="", query="my fallback query")
+        returned = Path(save_structured_report(rep, output_dir=tmp_path))
+        assert returned.stem.startswith("my fallback query_")
+
+    def test_all_punctuation_title_falls_back_to_query(self, tmp_path):
+        rep = _retitled(_report(), title="!!!", query="punctuated title query")
+        returned = Path(save_structured_report(rep, output_dir=tmp_path))
+        assert returned.stem.startswith("punctuated title query_")

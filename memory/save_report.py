@@ -300,6 +300,42 @@ def _validate_query(query: str) -> Tuple[bool, str]:
     return True, safe
 
 
+_SAFE_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
+
+
+def _name_to_stem(name: str) -> str:
+    """Convert an LLM-generated report title into a safe filename stem base.
+
+    Lowercases, replaces every char that is not [a-z0-9] with '_', collapses
+    runs of '_', strips leading/trailing '_', then caps at 60 chars on a
+    word boundary: tokens are joined until the running length would exceed
+    60 and any trailing partial token is dropped (so names like
+    'genetic_programming_report' never end mid-word). Returns '' when
+    nothing usable remains — callers fall back to the query-based logic.
+    """
+    if not name:
+        return ""
+    s = "".join(c if c in _SAFE_NAME_CHARS else "_" for c in name.strip().lower())
+    s = re.sub(r"_{2,}", "_", s).strip("_")
+    if not s:
+        return ""
+    tokens = s.split("_")
+    out: list[str] = []
+    length = 0
+    for tok in tokens:
+        if not out:
+            if len(tok) > 60:
+                break
+            out.append(tok)
+            length = len(tok)
+        else:
+            if length + 1 + len(tok) > 60:
+                break
+            out.append(tok)
+            length += 1 + len(tok)
+    return "_".join(out)
+
+
 def _parse_evidence_json(evidence_json: str) -> Tuple[List[EvidenceChunk], List[WebResult]]:
     """Parse evidence JSON string into structured data.
     
@@ -610,7 +646,8 @@ def save_report(
     session_id: str = "default",
     state: Optional[JsonDict] = None,
     output_dir: Optional[Path] = None,
-    config: Optional[ReportConfig] = None
+    config: Optional[ReportConfig] = None,
+    title: str = "",
 ) -> str:
     """Save a research report to a markdown file with comprehensive structure.
 
@@ -626,6 +663,8 @@ def save_report(
                evidence and other metadata for enriched reporting.
         output_dir: Optional custom output directory. Defaults to reports/ directory.
         config: Optional configuration for report generation.
+        title: Optional LLM-generated report title. When non-empty it is
+               preferred over the query for filename generation.
         
     Returns:
         The absolute file path where the report was saved.
@@ -663,9 +702,15 @@ def save_report(
     if not safe_query:
         safe_query = "untitled"
     
+    # An LLM-generated title (when provided and usable) names the file
+    # instead of the raw query.
+    stem_base = _name_to_stem(title) if title else ""
+    if not stem_base:
+        stem_base = safe_query
+    
     # Generate timestamp and filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{safe_query}_{timestamp}.md"
+    filename = f"{stem_base}_{timestamp}.md"
     filepath = reports_dir / filename
     
     cfg = config or ReportConfig.default()
@@ -1158,7 +1203,8 @@ def save_structured_report(
 ) -> str:
     """Save a validated structured report to reports/ (plan section 7.1).
 
-    Writes, all sharing the stem {safe_query}_{timestamp}:
+    Writes, all sharing the stem {stem_base}_{timestamp} (stem_base from the
+    LLM report title when usable, else the sanitized query):
     - {stem}.json         — the canonical structured document
     - {stem}.sources.json — standalone sources array (for the doc-gen project)
     - {stem}.markdown.md  — deterministic Markdown export (render_markdown)
@@ -1190,11 +1236,16 @@ def save_structured_report(
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = config or ReportConfig.default()
-    _valid, safe_query = _validate_query(report.report.metadata.query or "")
-    if not safe_query:
-        safe_query = "untitled"
+    title = (report.report.metadata.title or "").strip()
+    stem_base = _name_to_stem(title) if title else ""
+    if not stem_base:
+        # No usable LLM title: existing query-based fallback (untitled etc.).
+        _valid, safe_query = _validate_query(report.report.metadata.query or "")
+        if not safe_query:
+            safe_query = "untitled"
+        stem_base = safe_query
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem = f"{safe_query}_{timestamp}"
+    stem = f"{stem_base}_{timestamp}"
 
     json_path = reports_dir / f"{stem}.json"
     sources_path = reports_dir / f"{stem}.sources.json"
