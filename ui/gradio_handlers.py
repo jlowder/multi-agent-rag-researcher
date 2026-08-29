@@ -139,15 +139,20 @@ def ingest_source_documents(file_paths: list[str] | None) -> tuple[str, dict]:
             source = "docs/"
             source_key = "docs"
 
-        # Drop corpus entries for PDFs deleted since the last ingest (and the
-        # evidence packs built on them) before re-ingesting. Never blocks
-        # startup: a reconcile failure just leaves the old corpus in place.
-        try:
-            vanished = reconcile_corpus(DEFAULT_DOCS_DIR)
-            if vanished:
-                clear_evidence_cache()
-        except Exception as exc:
-            print(f"WARNING: corpus reconcile failed: {type(exc).__name__}: {exc}")
+            # Drop corpus entries for PDFs deleted since the last ingest (and
+            # the evidence packs built on them) before re-ingesting. Never
+            # blocks startup: a reconcile failure just leaves the old corpus
+            # in place. Page-load path only: with uploads, ingest does a full
+            # reset_collection of the staged dir, making a docs/-based
+            # reconcile redundant and able to desync the catalog (reconcile
+            # rewrites it to docs/ survivors while the reset then leaves the
+            # collection with uploads only).
+            try:
+                vanished = reconcile_corpus(DEFAULT_DOCS_DIR)
+                if vanished:
+                    clear_evidence_cache()
+            except Exception as exc:
+                print(f"WARNING: corpus reconcile failed: {type(exc).__name__}: {exc}")
 
         info = ingest_documents(pdf_dir)
         next_state = build_app_state(ready=True, source=source, source_key=source_key)
