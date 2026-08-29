@@ -28,6 +28,7 @@ UTILS_DIR = Path(__file__).resolve().parents[1] / "utils"
 ENV_FILE_PATH = UTILS_DIR / "var.env"
 QDRANT_STORAGE_PATH = UTILS_DIR / "qdrant_storage"
 INDEXED_DOCUMENTS_PATH = UTILS_DIR / "indexed_documents.json"
+DEFAULT_DOCS_DIR = UTILS_DIR.parent / "docs"
 
 load_dotenv(ENV_FILE_PATH)
 
@@ -284,6 +285,84 @@ def ingest_documents(pdf_dir: Path) -> dict:
         "num_chunks": len(document_chunks),
         "collection_name": COLLECTION_NAME,
     }
+
+
+# Reconcile the qdrant collection and saved catalog against the on-disk pdf
+# directory. Documents whose indexed file no longer exists on disk (deleted
+# manually, e.g. docs/ emptied) are removed from the collection in one
+# filtered delete and from the catalog file, so a stale corpus cannot keep
+# polluting search results. Returns the vanished document names ([] when the
+# corpus is already consistent, or the collection was empty/missing).
+# Idempotent: a second run finds nothing to purge and performs no writes.
+def reconcile_corpus(pdf_dir: Optional[Path] = None) -> list[str]:
+    if pdf_dir is None:
+        pdf_dir = DEFAULT_DOCS_DIR
+
+    on_disk = {path.name for path in pdf_dir.glob("*.pdf")} if pdf_dir.exists() else set()
+
+    client = get_qdrant_client()
+    if not client.collection_exists(COLLECTION_NAME):
+        # No collection yet: nothing to reconcile; ensure it exists so the
+        # normal ingest/search path starts from a known state.
+        client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=models.VectorParams(
+                size=EMBEDDING_VECTOR_SIZE,
+                distance=models.Distance.COSINE,
+            ),
+        )
+        return []
+
+    # Authoritative indexed document set from the collection payloads (same
+    # scroll pattern as get_indexed_document_catalog).
+    indexed: dict[str, str] = {}
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=COLLECTION_NAME,
+            limit=256,
+            offset=offset,
+            with_payload=["document_name", "document_title"],
+            with_vectors=False,
+        )
+        for point in points:
+            payload = point.payload or {}
+            document_name = payload.get("document_name")
+            if document_name:
+                indexed.setdefault(
+                    document_name,
+                    payload.get("document_title") or extract_document_title(Path(document_name), []),
+                )
+        if offset is None:
+            break
+
+    vanished = sorted(name for name in indexed if name not in on_disk)
+    if not vanished:
+        return []
+
+    client.delete(
+        COLLECTION_NAME,
+        models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="document_name",
+                    # MatchAny's list field is named `any` in qdrant-client
+                    # 1.17 (older releases called it `value`).
+                    match=models.MatchAny(any=vanished),
+                )
+            ]
+        ),
+    )
+
+    # Mirror the saved-catalog structure: keep the surviving documents, sorted.
+    save_indexed_document_catalog(
+        [
+            {"file_name": document_name, "title": title}
+            for document_name, title in sorted(indexed.items())
+            if document_name in on_disk
+        ]
+    )
+    return vanished
 
 
 # run similarity search and return grouped chunk results

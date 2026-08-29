@@ -112,6 +112,15 @@ def purge_stale(ttl_days: int) -> None:
         _delete_stale(conn, ttl_days)
 
 
+# drop every cached evidence pack (whole table) and return the rowcount.
+# Called at ingest entry points when the corpus was reconciled away, so
+# stale-document packs can't be reused for a new corpus.
+def clear_evidence_cache() -> int:
+    with get_evidence_cache_connection() as conn:
+        cursor = conn.execute("DELETE FROM evidence_cache")
+        return cursor.rowcount
+
+
 # store (or replace) the evidence pack for this session + sub-topic
 def save_evidence(
     session_id: str,
