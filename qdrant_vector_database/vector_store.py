@@ -341,8 +341,8 @@ def reconcile_corpus(pdf_dir: Optional[Path] = None) -> list[str]:
         return []
 
     client.delete(
-        collection_name=COLLECTION_NAME,
-        filter=models.Filter(
+        COLLECTION_NAME,
+        models.Filter(
             must=[
                 models.FieldCondition(
                     key="document_name",
