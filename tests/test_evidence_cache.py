@@ -191,6 +191,25 @@ def test_empty_question_returns_none(monkeypatch, tmp_path):
     assert _row_count() == 0
 
 
+def test_clear_evidence_cache_drops_every_row(monkeypatch, tmp_path):
+    _fresh_db(monkeypatch, tmp_path)
+    _insert("s1", "topic one", _days_ago(1), _pack("one"))
+    _insert("s2", "topic two", _days_ago(1), _pack("two"))
+    assert ecache.clear_evidence_cache() == 2
+    assert _row_count() == 0
+    assert ecache.lookup_evidence("topic one", 30) is None
+    # Idempotent: a second clear on the empty table reports 0.
+    assert ecache.clear_evidence_cache() == 0
+
+
+def test_clear_evidence_cache_creates_table_when_db_absent(
+    monkeypatch, tmp_path
+):
+    _fresh_db(monkeypatch, tmp_path)  # points at a not-yet-existing file
+    assert ecache.clear_evidence_cache() == 0
+    assert (tmp_path / "evidence_cache.db").exists()
+
+
 # ---------------------------------------------------------------------------
 # Pipeline integration — stage-2 reuse, stats, fresh-pack storage
 # ---------------------------------------------------------------------------

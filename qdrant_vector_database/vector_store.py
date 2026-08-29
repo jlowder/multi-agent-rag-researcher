@@ -346,7 +346,9 @@ def reconcile_corpus(pdf_dir: Optional[Path] = None) -> list[str]:
             must=[
                 models.FieldCondition(
                     key="document_name",
-                    match=models.MatchAny(value=vanished),
+                    # MatchAny's list field is named `any` in qdrant-client
+                    # 1.17 (older releases called it `value`).
+                    match=models.MatchAny(any=vanished),
                 )
             ]
         ),
