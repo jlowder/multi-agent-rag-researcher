@@ -1110,6 +1110,14 @@ def _render_block(block) -> List[str]:
         lines.append(f"```{lang}")
         lines.append((block.text or "").rstrip("\n"))
         lines.append("```")
+    elif btype == "equation":
+        # Display math: emit a $$…$$ paragraph. The text is raw LaTeX — if a
+        # model wrapped it anyway, never double-wrap.
+        text = _collapse_ws(block.text)
+        if text:
+            if "$$" not in text:
+                text = f"$$ {text} $$"
+            lines.append(text)
     elif btype == "page_break":
         lines.append("---")
     elif btype == "citation_note":

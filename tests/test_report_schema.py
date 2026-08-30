@@ -185,6 +185,25 @@ def test_invalid_block_type_still_rejected():
         ReportBlock.model_validate({"type": "nonsense"})
 
 
+def test_equation_block_validates():
+    block = ReportBlock.model_validate(
+        {"type": "equation", "text": "E = mc^2", "language": "latex"}
+    )
+    assert block.type == BlockType.equation
+    assert block.text == "E = mc^2"
+    assert block.language == "latex"
+    dumped = block.model_dump()
+    assert dumped["type"] == "equation"
+    assert dumped["text"] == "E = mc^2"
+
+
+def test_equation_in_published_json_schema():
+    schema = to_json_schema()
+    defs = schema.get("$defs") or schema.get("definitions")
+    # The type property $refs the BlockType def, which carries the enum.
+    assert "equation" in defs["BlockType"]["enum"]
+
+
 def test_density_hand_computed():
     words = [f"w{i:02d}" for i in range(100)]
     spans = [
