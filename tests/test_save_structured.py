@@ -119,6 +119,11 @@ class TestRenderMarkdown:
                     rows=[[Span(text="a1"), Span(text="b1")], [Span(text="a2"), Span(text="b2")]],
                 ),
                 ReportBlock(type=BlockType.code_block, language="python", text="x = 1"),
+                ReportBlock(
+                    type=BlockType.equation,
+                    text="L = \\sum_i l_i",
+                    language="latex",
+                ),
                 ReportBlock(type=BlockType.page_break),
                 ReportBlock(
                     type=BlockType.citation_note,
@@ -137,8 +142,27 @@ class TestRenderMarkdown:
         assert "| --- | --- |" in md
         assert "| a1 | b1 |" in md
         assert "```python\nx = 1\n```" in md
+        assert "$$ L = \\sum_i l_i $$" in md
         assert "---" in md
         assert "> Evidence does not cover X." in md
+
+    def test_equation_not_double_wrapped(self):
+        # A model that wraps the equation text in $$ anyway must not get
+        # $$…$$ inside $$…$$.
+        section = Section(
+            id="s1",
+            heading="H",
+            blocks=[
+                ReportBlock(
+                    type=BlockType.equation,
+                    text="$$E = mc^2$$",
+                    language="latex",
+                )
+            ],
+        )
+        md = render_markdown(_report(sections=[section]))
+        assert "$$E = mc^2$$" in md
+        assert "$$ $$" not in md
 
     def test_accepts_inner_report_and_rejects_garbage(self):
         rep = _report()

@@ -162,7 +162,8 @@ Each section corresponds to one `write_section()` or `write_synthesis()` call:
 | `unordered_list` | Bullet list | Yes | No |
 | `callout` | Note/warning/info box | Yes | No |
 | `comparison_table` | Row/column data | Yes | Rows array |
-| `code_block` | Code / formula | No (single `language` + `text`) | No |
+| `code_block` | Code snippets (never math) | No (single `language` + `text`) | No |
+| `equation` | One display formula (raw LaTeX) | No (single `text`, optional `language`) | No |
 | `page_break` | Force a new page | No | No |
 | `citation_note` | "The available evidence does not cover X" | Yes | No |
 
@@ -230,6 +231,7 @@ class BlockType(str, Enum):
     callout = "callout"
     comparison_table = "comparison_table"
     code_block = "code_block"
+    equation = "equation"
     page_break = "page_break"
     citation_note = "citation_note"
 

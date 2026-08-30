@@ -20,6 +20,48 @@ _CITATION_KEY_RE = re.compile(r"[DW]\d+")
 _JSON_DECODER = json.JSONDecoder()
 
 
+# Shared math-writing rules, appended to every writer prompt. Math must be
+# LaTeX (the PDF engine renders it with KaTeX); the current failure modes
+# are Unicode super/subscripts in prose (x², y₀, ẋ, ⁿ) and display math
+# dumped into code_block (renders as a monospace snippet, not a formula).
+_MATH_RULES_JSON = """
+MATH — all mathematics is written in LaTeX (the PDF engine renders it with
+KaTeX). These rules are mandatory:
+- Inline math: use $...$ inside a span's text — e.g. "growth of $e^{rt}$
+  outpaced the baseline". Put no space after an opening $ or before a
+  closing $, and close the $ before any following word or digit ($5 and
+  $10 stays plain text). A literal dollar sign is written as \\$
+- Display math: emit a dedicated equation block, ONE formula per block:
+  {"type":"equation","text":"E = mc^2","language":"latex"}. The text is
+  RAW LaTeX — never wrap it in $$ or \\[ \\]. NEVER put math in a
+  code_block; that renders as a monospace code snippet, not a formula.
+- Use LaTeX commands, never Unicode: \\frac{a}{b}, \\sqrt{}, \\sum, \\int,
+  ^{} for superscripts, _{} for subscripts, \\dot{x}, \\le, \\approx,
+  \\alpha. NEVER emit Unicode super/subscripts or math symbols in prose
+  (x², y₀, ẋ, ⁿ, ≤, ≈).
+- Explanatory prose (what each symbol means) stays in normal span text
+  outside the math delimiters, with its citations as usual.
+"""
+
+# Markdown-mode variant of the same rules: display math is a standalone
+# $$…$$ paragraph (never a fenced code block).
+_MATH_RULES_MD = r"""
+MATH — all mathematics is written in LaTeX (the PDF engine renders it with
+KaTeX). These rules are mandatory:
+- Inline math: use $...$ inside a sentence — no space right after an
+  opening $ or before a closing $; a literal dollar sign is written as \$.
+- Display math: a standalone $$...$$ paragraph on its own line. NEVER put
+  display math in a fenced code block — that renders as monospace text,
+  not a formula.
+- Use LaTeX commands, never Unicode: \frac{a}{b}, \sqrt{}, \sum, \int,
+  ^{} for superscripts, _{} for subscripts, \dot{x}, \le, \approx,
+  \alpha. NEVER emit Unicode super/subscripts or math symbols in prose
+  (x², y₀, ẋ, ⁿ, ≤, ≈).
+- Explanatory prose (what each symbol means) stays outside the math
+  delimiters, with citations as usual.
+"""
+
+
 def _extract_json_object_span(text: str) -> tuple[dict | None, int]:
     """Extract a single JSON object from a model response (best-effort),
     returning (object, end-offset).
@@ -262,7 +304,8 @@ CONTRACT — all of these are mandatory:
    unordered_list/ordered_list {"type":"...","items":[{"text":"...","citations":[...]}]}
    callout {"type":"callout","callout_type":"note|warning|info","spans":[...]}
    comparison_table {"type":"comparison_table","caption":"...","columns":["A","B"],"rows":[[{"text":"cell","citations":["D1"]},{"text":"cell2","citations":[]}]]}
-   code_block {"type":"code_block","language":"...","text":"..."}
+   code_block {"type":"code_block","language":"...","text":"..."}   (code snippets only — NEVER for math)
+   equation {"type":"equation","text":"<raw LaTeX, no outer delimiters>","language":"latex"}
    page_break {"type":"page_break"}
    citation_note {"type":"citation_note","spans":[...]}
    Table cells and list items must be span objects, never bare strings.
@@ -276,7 +319,7 @@ CONTRACT — all of these are mandatory:
 
 Example of one paragraph block with per-sentence citation spans:
 {"type":"paragraph","spans":[{"text":"Grid-scale deployment rose sharply","citations":[]},{"text":"in several major electricity markets","citations":["D1","W2"]},{"text":"through 2024","citations":["D1"]}]}
-"""
+""" + _MATH_RULES_JSON
 
 
 SYNTHESIS_JSON_INSTRUCTIONS = """
@@ -306,14 +349,15 @@ CONTRACT — all of these are mandatory:
    unordered_list/ordered_list {"type":"...","items":[{"text":"...","citations":[...]}]}
    callout {"type":"callout","callout_type":"note|warning|info","spans":[...]}
    comparison_table {"type":"comparison_table","caption":"...","columns":["A","B"],"rows":[[{"text":"cell","citations":["D1"]},{"text":"cell2","citations":[]}]]}
-   code_block {"type":"code_block","language":"...","text":"..."}
+   code_block {"type":"code_block","language":"...","text":"..."}   (code snippets only — NEVER for math)
+   equation {"type":"equation","text":"<raw LaTeX, no outer delimiters>","language":"latex"}
    page_break {"type":"page_break"}
    citation_note {"type":"citation_note","spans":[...]}
    Table cells and list items must be span objects, never bare strings.
 8. Per-sentence spans: split each paragraph into spans so the span that ends
    a cited sentence carries that sentence's citation keys; uncited
    transition spans get citations []. Use at least 2 blocks.
-"""
+""" + _MATH_RULES_JSON
 
 
 WRITE_REPORT_JSON_INSTRUCTIONS = """
@@ -346,7 +390,8 @@ CONTRACT — all of these are mandatory:
    unordered_list/ordered_list {"type":"...","items":[{"text":"...","citations":[...]}]}
    callout {"type":"callout","callout_type":"note|warning|info","spans":[...]}
    comparison_table {"type":"comparison_table","caption":"...","columns":["A","B"],"rows":[[{"text":"cell","citations":["D1"]},{"text":"cell2","citations":[]}]]}
-   code_block {"type":"code_block","language":"...","text":"..."}
+   code_block {"type":"code_block","language":"...","text":"..."}   (code snippets only — NEVER for math)
+   equation {"type":"equation","text":"<raw LaTeX, no outer delimiters>","language":"latex"}
    page_break {"type":"page_break"}
    citation_note {"type":"citation_note","spans":[...]}
    Table cells and list items must be span objects, never bare strings.
@@ -364,7 +409,7 @@ CONTRACT — all of these are mandatory:
 8. When the evidence does not cover a fact you would need, write "the
    available evidence does not cover X" — an honest gap. Never fill from
    memory. If the evidence is weak or incomplete, say so.
-"""
+""" + _MATH_RULES_JSON
 
 
 def writer_agent(
@@ -432,7 +477,7 @@ def writer_agent(
           7. Limitations & Open Problems
           8. Synthesis
         - Step 2: After the outline, write each section under its own "##" heading with at least 300 words of substance — concrete facts, mechanisms, comparisons, and examples grounded in the evidence, not filler.
-        """
+        """ + _MATH_RULES_MD
     )
     instructions = WRITE_REPORT_JSON_INSTRUCTIONS if output_format == "json" else markdown_instructions
 
@@ -552,7 +597,7 @@ BANNED — the critic rejects sections that contain any of these:
 - Closing paragraphs of pure hedging or follow-up offers ("more research
   could…", "future work may explore…"). End on a substantive, cited
   statement.
-"""
+""" + _MATH_RULES_MD
 
 
 def write_section(
@@ -752,7 +797,7 @@ CONTRACT — all of these are mandatory:
    invent a key. A pure-synthesis sentence may carry no citation.
 6. Do NOT introduce new factual claims not present in the provided
    sections: you are connecting what is already there, not researching.
-"""
+""" + _MATH_RULES_MD
 
 
 def write_synthesis(

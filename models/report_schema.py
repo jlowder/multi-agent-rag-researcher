@@ -21,6 +21,7 @@ class BlockType(str, Enum):
     callout = "callout"
     comparison_table = "comparison_table"
     code_block = "code_block"
+    equation = "equation"
     page_break = "page_break"
     citation_note = "citation_note"
 

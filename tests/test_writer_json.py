@@ -590,3 +590,69 @@ def test_wrong_typed_id_soft_fails_instead_of_raising(monkeypatch):
     assert section.blocks == []
     assert section.heading == "Market"
     assert section.id == "market"
+
+
+# ---------------------------------------------------------------------------
+# G. Math prompt contract (LaTeX/KaTeX): equation block + MATH rules
+# ---------------------------------------------------------------------------
+
+
+def _assert_math_rules(instr: str) -> None:
+    """Shared contract checks: the prompt must teach the equation block,
+    ban math in code blocks, and ban Unicode super/subscripts."""
+    assert '"type":"equation"' in instr  # equation in the block vocabulary
+    assert "MATH" in instr  # the MATH rules section
+    assert "NEVER for math" in instr  # code_block annotation
+    assert "\\frac" in instr  # LaTeX commands (\frac after Python unescaping)
+    assert "ⁿ" in instr  # the banned-Unicode list is present
+
+
+EQUATION_SECTION_JSON = (
+    '{"id": "market", "heading": "Market",'
+    ' "blocks": [{"type": "equation",'
+    ' "text": "L = \\\\sum_i l_i", "language": "latex"}]}'
+)
+
+
+def test_section_json_prompt_teaches_equation_and_math(monkeypatch):
+    _, calls = _write_section(monkeypatch, SECTION_JSON, output_format="json")
+    _assert_math_rules(calls[0]["instructions"])
+
+
+def test_synthesis_json_prompt_teaches_equation_and_math(monkeypatch):
+    calls = _patch_run_model(monkeypatch, SYNTHESIS_JSON)
+    wmod.write_synthesis(
+        "Explain fusion energy",
+        [("Definition & Background", "## Definition & Background\n\nBody [D1].")],
+        output_format="json",
+    )
+    _assert_math_rules(calls[0]["instructions"])
+
+
+def test_report_json_prompt_teaches_equation_and_math(monkeypatch):
+    _, calls = _run_writer(monkeypatch, REPORT_JSON, output_format="json")
+    _assert_math_rules(calls[0]["instructions"])
+
+
+def test_section_markdown_prompt_teaches_math(monkeypatch):
+    _, calls = _write_section(monkeypatch, "## Market\n\nBody [D1].", output_format="markdown")
+    instr = calls[0]["instructions"]
+    assert "MATH" in instr
+    assert "$$...$$" in instr  # display math is a $$ paragraph in markdown mode
+    assert "fenced code block" in instr  # never a code block
+    assert "ⁿ" in instr
+
+
+def test_writer_markdown_prompt_teaches_math(monkeypatch):
+    calls = _patch_run_model(monkeypatch, "# T\n\nBody [D1].")
+    wmod.writer_agent(user_query="q", evidence_text="[D1] E.", output_format="markdown")
+    assert "MATH" in calls[0]["instructions"]
+
+
+def test_equation_block_round_trips_through_write_section(monkeypatch):
+    section, _ = _write_section(monkeypatch, EQUATION_SECTION_JSON, output_format="json")
+    assert len(section.blocks) == 1
+    eq = section.blocks[0]
+    assert eq.type.value == "equation"
+    assert eq.text == "L = \\sum_i l_i"  # the JSON \sum decodes to one backslash
+    assert eq.language == "latex"
