@@ -1203,6 +1203,70 @@ def render_markdown(report) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
+def unescape_double_escaped_quotes(text: str) -> str:
+    """Undo LLM double-escaped quotes in prose span text.
+
+    The writer LLM occasionally emits an extra escaping layer (a JSON value
+    containing backslash-backslash-backslash-quote instead of the usual
+    backslash-quote), which decodes to a literal backslash+quote that shows
+    up verbatim in rendered reports. Outside ``$…$`` / ``$$…$$`` / ``\\(…\\)``
+    / ``\\[…\\]`` math segments, replace backslash-quote with ``"`` and
+    backslash-apostrophe with ``'``. Backslashes inside math (legit TeX)
+    are untouched; equation/code blocks never have spans, so their content
+    is never passed through here.
+    """
+    if '\\"' not in text and "\\'" not in text:
+        return text
+
+    def _math_end(i: int) -> int:
+        """Index just past the math segment starting at text[i], else -1.
+
+        Pandoc-like inline rules: the char after an opening ``$`` must not
+        be a space, the char before the closing ``$`` must not be a space,
+        and the char after the closing ``$`` must not be a digit.
+        """
+        n = len(text)
+        if text.startswith("$$", i):
+            j = text.find("$$", i + 2)
+            return j + 2 if j != -1 else -1
+        if text[i] == "\\" and i + 1 < n and text[i + 1] in "([":
+            j = text.find("\\" + text[i + 1], i + 2)
+            return j + 2 if j != -1 else -1
+        if text[i] == "$" and i + 1 < n and text[i + 1] != " ":
+            j = i + 1
+            while j < n:
+                if text[j] == "\\" and j + 1 < n:  # escaped char inside math
+                    j += 2
+                    continue
+                if text[j] == "$" and text[j - 1] != " ":
+                    if j + 1 >= n or not text[j + 1].isdigit():
+                        return j + 1
+                j += 1
+        return -1
+
+    segments = []
+    i = 0
+    while i < len(text):
+        end = _math_end(i)
+        if end == -1:
+            i += 1
+        else:
+            segments.append((i, end))
+            i = end
+
+    def _fix(part: str) -> str:
+        return part.replace('\\"', '"').replace("\\'", "'")
+
+    out = []
+    last = 0
+    for a, b in segments:
+        out.append(_fix(text[last:a]))
+        out.append(text[a:b])
+        last = b
+    out.append(_fix(text[last:]))
+    return "".join(out)
+
+
 def save_structured_report(
     report,
     output_dir: Optional[Path] = None,
@@ -1236,6 +1300,14 @@ def save_structured_report(
             f"save_structured_report expects a ResearchReport, "
             f"got {type(report).__name__}"
         )
+
+    # Guard: the writer LLM occasionally double-escapes quotes in prose
+    # spans; un-escape them here (spans only — equation/code content, which
+    # legitimately carries backslashes, never has spans and is skipped).
+    for section in report.report.sections:
+        for block in section.blocks:
+            for span in block.spans:
+                span.text = unescape_double_escaped_quotes(span.text)
 
     if output_dir is None:
         reports_dir = Path(__file__).parent.parent / "reports"

@@ -12,7 +12,11 @@ from deep_research_structured import parse_exec_summary
 
 wmod = importlib.import_module("worker_agents.writer_agent")
 save_mod = importlib.import_module("memory.save_report")
-from memory.save_report import render_markdown, save_structured_report
+from memory.save_report import (
+    render_markdown,
+    save_structured_report,
+    unescape_double_escaped_quotes,
+)
 from models.report_schema import (
     BlockType,
     Metadata,
@@ -251,6 +255,50 @@ class TestSaveStructuredReport:
     def test_rejects_garbage(self, tmp_path):
         with pytest.raises(TypeError):
             save_structured_report("nope", output_dir=tmp_path)
+
+
+class TestQuoteSanitizer:
+    """Guard against writer-LLM double-escaped quotes (see save_structured_report)."""
+
+    def test_unescapes_prose_and_skips_math(self):
+        assert unescape_double_escaped_quotes('To \\"solve\\" an ODE') == 'To "solve" an ODE'
+        assert unescape_double_escaped_quotes("x\\'s") == "x's"
+        # composite: prose quotes fixed, TeX backslash inside math untouched
+        assert (
+            unescape_double_escaped_quotes('a \\"q\\" and $x \\ne y$ end')
+            == 'a "q" and $x \\ne y$ end'
+        )
+        # no artifact present: byte-identical, TeX commands left alone
+        unchanged = 'check $\\frac{a}{b}$ now'
+        assert unescape_double_escaped_quotes(unchanged) == unchanged
+
+    def test_save_sanitizes_spans_not_code(self, tmp_path):
+        rep = _report(
+            sections=[
+                Section(
+                    id="s1",
+                    heading="S1",
+                    blocks=[
+                        ReportBlock(
+                            type=BlockType.paragraph,
+                            spans=[Span(text='To \\"solve\\" an ODE')],
+                        ),
+                        ReportBlock(
+                            type=BlockType.code_block,
+                            language="js",
+                            text='alert(\\"hi\\")',  # backslashes must stay
+                        ),
+                    ],
+                )
+            ],
+        )
+        returned = save_structured_report(rep, output_dir=tmp_path)
+        saved = json.loads(Path(returned).read_text())
+        blocks = saved["report"]["sections"][0]["blocks"]
+        assert blocks[0]["spans"][0]["text"] == 'To "solve" an ODE'
+        assert blocks[1]["text"] == 'alert(\\"hi\\")', "code_block content must be untouched"
+        md = Path(returned).with_suffix(".markdown.md").read_text()
+        assert 'To "solve" an ODE' in md
 
 
 def test_markdown_save_report_still_works(tmp_path):
