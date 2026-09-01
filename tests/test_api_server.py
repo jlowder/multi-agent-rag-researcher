@@ -253,6 +253,41 @@ def test_health(client):
 
 
 # ---------------------------------------------------------------------------
+# CORS (browser-based clients)
+# ---------------------------------------------------------------------------
+
+ORIGIN = {"Origin": "http://localhost:1234"}
+
+
+def test_health_has_cors_headers_with_origin(client):
+    resp = client.get("/health", headers=ORIGIN)
+    assert resp.status_code == 200
+    assert resp.headers["access-control-allow-origin"] == "*"
+
+
+def test_options_preflight_allows_post_json(client):
+    resp = client.options(
+        "/research",
+        headers={
+            **ORIGIN,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Content-Type": "application/json",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert resp.status_code in (200, 204)
+    assert resp.headers["access-control-allow-origin"] == "*"
+    assert "POST" in resp.headers["access-control-allow-methods"]
+    assert "content-type" in resp.headers["access-control-allow-headers"]
+
+
+def test_post_research_has_cors_headers_with_origin(client):
+    resp = client.post("/research", json={"topic": "tiny topic"}, headers=ORIGIN)
+    assert resp.status_code == 202
+    assert resp.headers["access-control-allow-origin"] == "*"
+
+
+# ---------------------------------------------------------------------------
 # Integration: REAL deep_research through the API (all LLM surfaces stubbed)
 # ---------------------------------------------------------------------------
 

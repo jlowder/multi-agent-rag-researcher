@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
@@ -114,6 +115,17 @@ def create_app(
     per-task watchdog thread (exceeded runs are marked failed).
     """
     app = FastAPI(title=f"{SERVICE_NAME} API")
+
+    # Permissive CORS so browser-based clients (HTML API testers, web
+    # front-ends) work out of the box. CORSMiddleware answers OPTIONS
+    # preflights itself, so no explicit OPTIONS routes are needed.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
 
     tasks: dict[str, TaskRecord] = {}
     lock = threading.Lock()

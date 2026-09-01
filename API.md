@@ -188,5 +188,5 @@ curl -s -X POST -H 'content-type: application/json' -d @report.json \
 ## Notes
 
 - No authentication: bind to localhost or put the service behind an authenticating proxy.
-- CORS is not configured — the service is intended for server-to-server use.
+- Permissive CORS is enabled (Access-Control-Allow-Origin: *, all methods/headers) so browser-based clients (e.g. HTML API testers, web front-ends) work out of the box; it is permissive on purpose — put the service behind a proxy/restrict origins if exposed to untrusted networks.
 - Tests: `venv/bin/python -m pytest tests/ -q`. `tests/test_api_server.py` covers the full task lifecycle with a fake run function (fully offline) plus one end-to-end test that runs the real pipeline with every LLM/retrieval surface stubbed.

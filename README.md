@@ -262,6 +262,8 @@ curl -s localhost:8000/research/<id>                                  # → stat
 curl -s localhost:8000/research/<id>/report -o report.json            # → paperbot /render
 ```
 
+Permissive CORS is enabled, so browser-based clients (an HTML API tester, a web front-end) can call the service directly out of the box.
+
 Full reference (all endpoints, step tracking, lifecycle, paperbot integration): [API.md](API.md).
 
 ## Configuration
