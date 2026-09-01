@@ -273,7 +273,7 @@ def assemble_structured_report(
     """Deterministically assemble a validated ResearchReport from written
     sections and the citation registry (plan §6). No LLM calls.
 
-    Steps: flag unresolvable citations, drop bare-numeric citations,
+    Steps: collapse adjacent duplicate blocks, flag unresolvable citations, drop bare-numeric citations,
     renumber [DW]# keys to 1..N in first-appearance order, map the cited
     registry entries to Source records (plan §8.1), and compute quality
     metrics. `evidence_json` is accepted for interface stability and
@@ -297,6 +297,8 @@ def assemble_structured_report(
         ),
         quality=QualityMetrics(),
     )
+
+    _collapse_adjacent_duplicate_blocks(report)
 
     unresolvable = find_unresolvable_citations(report, registry)
     dropped = drop_bare_numeric_citations(report, registry)
@@ -327,6 +329,28 @@ def assemble_structured_report(
     report.quality.total_words = count_total_words(report)
 
     return report
+
+
+def _collapse_adjacent_duplicate_blocks(report: ResearchReport) -> None:
+    """Collapse runs of ADJACENT byte-identical blocks to one, in place.
+
+    Final defense against a degenerate LLM loop that re-emits the same block
+    (e.g. one note callout written 14x). Conservative by design: only
+    consecutive identical blocks (normalized JSON via model_dump_json, so
+    type + spans + type-specific fields) are collapsed; identical blocks
+    separated by other content are kept, and non-adjacent duplicates across
+    sections never interact. Never raises.
+    """
+    try:
+        for section in report.report.sections:
+            kept: list[ReportBlock] = []
+            for block in section.blocks or []:
+                if kept and block.model_dump_json() == kept[-1].model_dump_json():
+                    continue
+                kept.append(block)
+            section.blocks = kept
+    except Exception:
+        pass
 
 
 def sections_plain_text(section: Section) -> str:

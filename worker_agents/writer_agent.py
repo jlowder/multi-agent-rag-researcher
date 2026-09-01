@@ -127,20 +127,30 @@ _BLOCK_VOCAB = frozenset(t.value for t in BlockType)
 _MAX_RECOVERED_BLOCKS = 20
 
 
-def _recover_trailing_blocks(text: str, end: int) -> list[ReportBlock]:
+def _recover_trailing_blocks(
+    text: str, end: int, existing: list[ReportBlock] | None = None
+) -> list[ReportBlock]:
     """Premature-close recovery: some models close the section object early
     and keep writing the remaining blocks as trailing JSON. Scan `text[end:]`
     (raw_decode at every '{') and keep complete objects whose "type" is a
     block-vocabulary value and which validate as ReportBlock (the lenient
     string-cell coercion applies; invalids are skipped). Ignored entirely
     when the remainder is insignificant (<200 non-ws chars and no '{').
-    Capped at _MAX_RECOVERED_BLOCKS blocks."""
+    Capped at _MAX_RECOVERED_BLOCKS blocks.
+
+    Degenerate-loop guard: a recovered block that is an EXACT duplicate of a
+    block already in the section (`existing`, normalized via
+    model_dump_json) or of an earlier recovery in the same remainder is
+    dropped, so a model that re-emits one block after its premature close
+    cannot bloat the section; genuinely novel blocks are still salvaged."""
     if end < 0:
         return []
     remainder = text[end:]
     if len(remainder.strip()) < 200 and "{" not in remainder:
         return []
+    existing_keys = {block.model_dump_json() for block in (existing or [])}
     out: list[ReportBlock] = []
+    seen: set[str] = set()
     spans: list[tuple[int, int]] = []
     for i, ch in enumerate(remainder):
         if ch != "{" or len(out) >= _MAX_RECOVERED_BLOCKS:
@@ -154,9 +164,14 @@ def _recover_trailing_blocks(text: str, end: int) -> list[ReportBlock]:
         if any(start <= i < e for start, e in spans):
             continue
         try:
-            out.append(ReportBlock.model_validate(obj))
+            block = ReportBlock.model_validate(obj)
         except Exception:
             continue
+        key = block.model_dump_json()
+        if key in existing_keys or key in seen:
+            continue
+        out.append(block)
+        seen.add(key)
         spans.append((i, b_end))
     return out
 
@@ -741,7 +756,7 @@ def write_section(
                             )
             if section is not None:
                 if obj_end >= 0:
-                    recovered = _recover_trailing_blocks(text, obj_end)
+                    recovered = _recover_trailing_blocks(text, obj_end, section.blocks)
                     if recovered:
                         if verbose:
                             print(
@@ -916,7 +931,7 @@ def write_synthesis(
                             )
             if section is not None:
                 if obj_end >= 0:
-                    recovered = _recover_trailing_blocks(text, obj_end)
+                    recovered = _recover_trailing_blocks(text, obj_end, section.blocks)
                     if recovered:
                         if verbose:
                             print(
