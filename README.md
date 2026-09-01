@@ -18,6 +18,7 @@ The three worker agents are:
 5. SQLite for short-term memory
 6. Gradio UI for browser-based interaction
 7. An optional 5-stage deep-research pipeline (`--mode deep`) for long-form, heavily cited reports
+8. A FastAPI service (`api_server.py`) that serves the deep pipeline headlessly — see [API.md](API.md)
 
 ## Multi-Agent Architecture
 
@@ -124,6 +125,7 @@ A global budget caps a run at 40 LLM calls. If the budget runs out or an individ
 ├── worker_agents/                # Retriever, writer, verifier, and decomposer
 ├── orchestrator_agent.py         # Main coordinator (standard mode)
 ├── deep_research_orchestrator.py # 5-stage deep-research pipeline (deep mode)
+├── api_server.py                 # FastAPI service for the deep pipeline (API.md)
 ├── tests/                        # pytest suite
 └── run_orchestrator.py           # CLI entry point
 ```
@@ -246,6 +248,24 @@ The UI automatically loads the default PDFs from `docs/` on startup. If you uplo
 
 The UI has a **Mode** selector (standard, default / deep). Deep mode runs the 5-stage pipeline and streams the report section-by-section as it is drafted, with a live stage/elapsed-time status line.
 
+## API server
+
+The same deep-research pipeline, headless: a FastAPI service (`api_server.py`) that takes a topic over HTTP, tracks the run as a pollable task, and serves the finished report as the structured JSON envelope that paperbot renders to PDF/HTML.
+
+```bash
+venv/bin/python api_server.py   # PORT (default 8000), HOST (default 0.0.0.0)
+```
+
+```bash
+curl -s -X POST localhost:8000/research -H 'content-type: application/json' -d '{"topic":"…"}'   # → {"task_id":"…"}
+curl -s localhost:8000/research/<id>                                  # → status + current_step
+curl -s localhost:8000/research/<id>/report -o report.json            # → paperbot /render
+```
+
+Permissive CORS is enabled, so browser-based clients (an HTML API tester, a web front-end) can call the service directly out of the box.
+
+Full reference (all endpoints, step tracking, lifecycle, paperbot integration): [API.md](API.md).
+
 ## Configuration
 
 The live env file is `utils/var.env` (gitignored). It is auto-seeded from `.env.example` on first run, so changes to `.env.example` only affect fresh setups — edit `utils/var.env` to change this project's configuration.
@@ -262,7 +282,7 @@ The live env file is `utils/var.env` (gitignored). It is auto-seeded from `.env.
 venv/bin/python -m pytest tests/ -q
 ```
 
-The pytest suite (84 tests) covers the save-report flow, citation context and key renumbering, decomposition (structured and fallback parsing), per-sub-question investigation, the deep pipeline end-to-end, and config overrides. Use the project virtualenv — system Python lacks the project dependencies.
+The pytest suite (264 tests) covers the save-report flow, citation context and key renumbering, decomposition (structured and fallback parsing), per-sub-question investigation, the deep pipeline end-to-end, config overrides, and the API service (task lifecycle plus a stubbed end-to-end run). Use the project virtualenv — system Python lacks the project dependencies.
 
 ## Notes
 
