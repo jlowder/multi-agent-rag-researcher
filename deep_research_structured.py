@@ -233,29 +233,180 @@ def _collect_cited_keys(report: ResearchReport, registry: dict) -> list[str]:
     return out
 
 
-def _renumber_json_citations(report: ResearchReport, registry: dict, cited_keys: list) -> dict:
-    """Replace every citation-key reference in the report's blocks with its
-    [n] number (plan §6.3).
+_CITATION_BRACKET_RE = re.compile(
+    r"\[((?:[DW]\d+|\d+)(?:\s*,\s*(?:[DW]\d+|\d+))*)\]"
+)
 
-    key_to_number maps each key in `cited_keys` (first-appearance order,
-    registry-present only) to 1..N. Citation entries not in the map —
-    invented keys and bare numbers — are DROPPED (they were already
-    pruned/flagged upstream; be safe). Mutates `report` in place and
-    returns the key_to_number map.
+
+def _source_dedupe_unit(entry: dict) -> tuple:
+    """Dedupe unit of a registry entry. MUST mirror registry_to_sources
+    exactly: docs dedupe by document_name (fallback title), web by url
+    (fallback title); empty names/urls never collide (the or-"" guard).
     """
-    if not cited_keys:
-        cited_keys = _collect_cited_keys(report, registry)
-    known = set((registry or {}).keys())
-    key_to_number = {key: i + 1 for i, key in enumerate(cited_keys) if key in known}
+    entry = entry or {}
+    if entry.get("kind") == "doc":
+        return ("doc", (entry.get("document_name") or entry.get("title") or "").strip().lower())
+    return ("web", (entry.get("url") or "").strip().lower() or (entry.get("title") or "").strip().lower())
+
+
+def _build_key_to_source_map(registry: dict, sources: list) -> dict:
+    """Map every registry citation_key to the surviving Source record its
+    dedupe unit collapsed into: {key: (surviving_citation_key, position)}
+    where position is 1-based into `sources`. Keys whose unit (document / url)
+    has no surviving record are absent."""
+    unit_to_source: dict[tuple, tuple] = {}
+    for i, source in enumerate(sources or []):
+        entry = (registry or {}).get(source.citation_key) or {}
+        unit_to_source.setdefault(_source_dedupe_unit(entry), (source.citation_key, i + 1))
+    key_map: dict[str, tuple] = {}
+    for key, entry in (registry or {}).items():
+        target = unit_to_source.get(_source_dedupe_unit(entry))
+        if target is not None:
+            key_map[key] = target
+    return key_map
+
+
+def _remap_citations_to_final_sources(report: ResearchReport, registry: dict) -> dict:
+    """Renumber citation arrays AND rewrite [D#]/[W#] text markers onto the
+    FINAL deduped sources array (plan §6.3, after §8.1 dedupe).
+
+    `report.report.sources` must already hold the deduped records: numeric
+    entries are positions into that array, and every registry key —
+    including deduped non-primary keys — resolves to its surviving record's
+    citation_key and position, so both the `citations` arrays and the inline
+    bracket markers in span/item/cell text stay resolvable post-dedupe.
+    Citation entries that are not registry keys (invented keys, stale
+    numbers) are dropped; markers whose key has no surviving record are left
+    untouched. Mutates `report` in place; returns the key -> (citation_key,
+    position) map.
+    """
+    key_map = _build_key_to_source_map(registry, report.report.sources)
+
+    def _rewrite_markers(text: str) -> str:
+        def _repl(match: re.Match) -> str:
+            out_items: list[str] = []
+            for item in re.findall(r"[DW]\d+|\d+", match.group(1)):
+                if item[0] in "DW":
+                    target = key_map.get(item)
+                    key = target[0] if target is not None else item
+                else:
+                    key = item  # bare number: pass through for paperbot
+                if key not in out_items:
+                    out_items.append(key)
+            return "[" + ", ".join(out_items) + "]"
+
+        out = _CITATION_BRACKET_RE.sub(_repl, text or "")
+        out = re.sub(r" {2,}", " ", out)
+        out = re.sub(r" \.", ".", out)
+        return out
+
     for section in report.report.sections:
         for block in section.blocks:
             for holder in _iter_citation_holders(block):
-                holder.citations = [
-                    str(key_to_number[k])
-                    for k in (holder.citations or [])
-                    if k in key_to_number
-                ]
-    return key_to_number
+                if holder.citations:
+                    out_cits: list[str] = []
+                    for c in holder.citations:
+                        if c in key_map:
+                            pos = str(key_map[c][1])
+                            if pos not in out_cits:
+                                out_cits.append(pos)
+                    holder.citations = out_cits
+                if holder.text:
+                    holder.text = _rewrite_markers(holder.text)
+    return key_map
+
+
+# Display equation emitted without delimiters: a LaTeX control sequence,
+# no math delimiters, and no prose words once all \command{...} groups,
+# {...} groups, and bare \command tokens are stripped (single-letter
+# variables and ALL-CAPS labels survive; a lowercase run of 2+ vetoes).
+_LATEX_CMD_RE = re.compile(r"\\[a-zA-Z]+\b")
+_COMMAND_GROUP_RE = re.compile(r"\\[a-zA-Z]+\{[^{}]*\}")
+_BRACE_GROUP_RE = re.compile(r"\{[^{}]*\}")
+_BARE_LATEX_CMD_RE = re.compile(r"\\[a-zA-Z]+")
+_LOWERCASE_RUN_RE = re.compile(r"[a-z]{2,}")
+
+
+def _is_bare_equation(text: str) -> bool:
+    """True when a span's text is a display equation the writer emitted
+    without ANY math delimiters (no $ / $ / \\( / \[): it contains a LaTeX
+    control sequence, and after stripping \command{...} groups, {...}
+    groups, and bare \command tokens, no lowercase run of 2+ remains
+    (real prose would). Never raises."""
+    t = (text or "").strip()
+    if not t or "$" in t or "\\(" in t or "\\[" in t:
+        return False
+    if not _LATEX_CMD_RE.search(t):
+        return False
+    s = t
+    while True:
+        stripped = _COMMAND_GROUP_RE.sub(" ", s)
+        stripped = _BRACE_GROUP_RE.sub(" ", stripped)
+        stripped = _BARE_LATEX_CMD_RE.sub(" ", stripped)
+        if stripped == s:
+            break
+        s = stripped
+    return not _LOWERCASE_RUN_RE.search(s)
+
+
+def _promote_bare_equation_spans(report: ResearchReport) -> int:
+    """Promote paragraph spans that are undelimited display equations to
+    standalone equation blocks so downstream renderers (paperbot/KaTeX)
+    typeset them as math instead of printing raw TeX. Mixed paragraphs are
+    split, preserving span order; a paragraph whose spans are all promoted
+    becomes the equation blocks themselves. Never raises.
+
+    Returns the number of promoted spans.
+    """
+    promoted = 0
+    try:
+        for section in report.report.sections:
+            out: list[ReportBlock] = []
+            for block in section.blocks or []:
+                if block.type != "paragraph" or not block.spans:
+                    out.append(block)
+                    continue
+                parts: list[ReportBlock] = []
+                pending: list[Span] = []
+                changed = False
+                for span in block.spans:
+                    if _is_bare_equation(span.text):
+                        if pending:
+                            parts.append(
+                                ReportBlock(
+                                    type="paragraph",
+                                    text=block.text,
+                                    spans=pending,
+                                    citations=list(block.citations),
+                                )
+                            )
+                            pending = []
+                        equation = ReportBlock(
+                            type="equation",
+                            language="latex",
+                            text=span.text,
+                            citations=list(span.citations),
+                        )
+                        equation.spans = []  # text lives in .text, not a span
+                        parts.append(equation)
+                        changed = True
+                        promoted += 1
+                    else:
+                        pending.append(span)
+                if pending:
+                    parts.append(
+                        ReportBlock(
+                            type="paragraph",
+                            text=block.text,
+                            spans=pending,
+                            citations=list(block.citations),
+                        )
+                    )
+                out.extend(parts if changed else [block])
+            section.blocks = out
+    except Exception:
+        pass
+    return promoted
 
 
 def assemble_structured_report(
@@ -273,11 +424,14 @@ def assemble_structured_report(
     """Deterministically assemble a validated ResearchReport from written
     sections and the citation registry (plan §6). No LLM calls.
 
-    Steps: collapse adjacent duplicate blocks, flag unresolvable citations, drop bare-numeric citations,
-    renumber [DW]# keys to 1..N in first-appearance order, map the cited
-    registry entries to Source records (plan §8.1), and compute quality
-    metrics. `evidence_json` is accepted for interface stability and
-    reserved for future provenance fields.
+    Steps: collapse adjacent duplicate blocks, flag unresolvable citations,
+    drop bare-numeric citations, map the cited registry entries to deduped
+    Source records (plan §8.1), then renumber citation arrays and rewrite
+    [D#]/[W#] text markers onto those final records (plan §6.3 — positions
+    are 1-based into the deduped array, so they never go out of range),
+    promote undelimited display-equation spans to equation blocks, and
+    compute quality metrics. `evidence_json` is accepted for interface
+    stability and reserved for future provenance fields.
     """
     report = ResearchReport(
         schema_version="1.0",
@@ -306,10 +460,12 @@ def assemble_structured_report(
     not_generated = _apply_empty_section_guards(report)
 
     cited_keys = _collect_cited_keys(report, registry)
-    _renumber_json_citations(report, registry, cited_keys)
 
     source_dicts = registry_to_sources(registry, cited_keys)
     report.report.sources = [Source.model_validate(d) for d in source_dicts]
+
+    _remap_citations_to_final_sources(report, registry)
+    _promote_bare_equation_spans(report)
 
     report.quality.citation_density = compute_citation_density(report)
     report.quality.verification = {

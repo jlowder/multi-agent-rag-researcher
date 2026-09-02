@@ -239,6 +239,69 @@ class TestAssemble:
         assert isinstance(rep.quality.citation_density, dict)
 
 
+class TestCitationRemap:
+    def _assemble(self, *sections, registry):
+        return assemble_structured_report(
+            sections=list(sections),
+            registry=registry,
+            user_query="q",
+            session_id="s1",
+            exec_paragraphs=["Ex."],
+            verification_status={"confidence": "high"},
+            title="T",
+        )
+
+    def test_deduped_sources_remap_citations_and_markers(self):
+        # 3 chunks of one document + 2 results of one URL: 5 registry keys
+        # dedupe to 2 source records (first-cited key of each unit primary).
+        reg = {
+            "D1": dict(DOC_A),
+            "D2": dict(DOC_A, page_number=4),
+            "D3": dict(DOC_A, page_number=5),
+            "W1": dict(WEB_A),
+            "W2": dict(WEB_A),
+        }
+        s1 = Section(id="s1", heading="One", blocks=[_para([
+            ("Alpha claims [D1] and [D2, D3] clearly.", ["D1", "D2", "D3"]),
+            ("Web says [W1] while [W2] agrees.", ["W1", "W2"]),
+            _pad_span(),
+        ])])
+        rep = self._assemble(s1, registry=reg)
+        assert [s.citation_key for s in rep.report.sources] == ["D1", "W1"]
+        spans = rep.report.sections[0].blocks[0].spans
+        assert [sp.citations for sp in spans] == [["1"], ["2"], []]
+        assert all(c in ("1", "2") for sp in spans for c in sp.citations)
+        # Text markers rewritten onto the surviving keys; deduped keys gone.
+        assert "[D1]" in spans[0].text
+        assert "[D2" not in spans[0].text and "[D3" not in spans[0].text
+        assert "[W1]" in spans[1].text and "[W2" not in spans[1].text
+
+    def test_in_range_report_unchanged(self):
+        reg = {"D1": dict(DOC_A)}
+        s1 = Section(id="s1", heading="One", blocks=[_para([
+            ("Alpha result [D1] holds.", ["D1"]),
+            _pad_span(),
+        ])])
+        rep = self._assemble(s1, registry=reg)
+        assert [s.citation_key for s in rep.report.sources] == ["D1"]
+        span = rep.report.sections[0].blocks[0].spans[0]
+        assert span.text == "Alpha result [D1] holds."
+        assert span.citations == ["1"]
+
+    def test_stale_numeric_dropped_unknown_marker_left(self):
+        reg = {"D1": dict(DOC_A)}
+        s1 = Section(id="s1", heading="One", blocks=[_para([
+            ("Alpha [D1] and stale [D9] here.", ["D1", "D9", "7"]),
+            _pad_span(),
+        ])])
+        rep = self._assemble(s1, registry=reg)
+        span = rep.report.sections[0].blocks[0].spans[0]
+        assert span.citations == ["1"]  # stale number dropped
+        assert "[D1]" in span.text
+        assert "[D9]" in span.text  # no surviving record: left untouched
+        assert rep.quality.verification.get("unresolvable_citations") == ["D9"]
+
+
 class TestParseExecSummary:
     def test_json_array(self):
         assert parse_exec_summary('["A.", "B." ]') == ["A.", "B."]
