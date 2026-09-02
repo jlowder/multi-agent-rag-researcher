@@ -253,13 +253,13 @@ The UI has a **Mode** selector (standard, default / deep). Deep mode runs the 5-
 The same deep-research pipeline, headless: a FastAPI service (`api_server.py`) that takes a topic over HTTP, tracks the run as a pollable task, and serves the finished report as the structured JSON envelope that paperbot renders to PDF/HTML.
 
 ```bash
-venv/bin/python api_server.py   # PORT (default 8000), HOST (default 0.0.0.0)
+venv/bin/python api_server.py   # PORT (default 8321), HOST (default 0.0.0.0)
 ```
 
 ```bash
-curl -s -X POST localhost:8000/research -H 'content-type: application/json' -d '{"topic":"…"}'   # → {"task_id":"…"}
-curl -s localhost:8000/research/<id>                                  # → status + current_step
-curl -s localhost:8000/research/<id>/report -o report.json            # → paperbot /render
+curl -s -X POST localhost:8321/research -H 'content-type: application/json' -d '{"topic":"…"}'   # → {"task_id":"…"}
+curl -s localhost:8321/research/<id>                                  # → status + current_step
+curl -s localhost:8321/research/<id>/report -o report.json            # → paperbot /render
 ```
 
 Permissive CORS is enabled, so browser-based clients (an HTML API tester, a web front-end) can call the service directly out of the box.

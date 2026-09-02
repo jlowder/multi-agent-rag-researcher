@@ -16,13 +16,13 @@ Dependencies are pinned in `utils/requirements.txt` (`fastapi`, `uvicorn`):
 
 ```bash
 pip3 install -r utils/requirements.txt
-venv/bin/python api_server.py   # PORT env (default 8000), HOST env (default 0.0.0.0)
+venv/bin/python api_server.py   # PORT env (default 8321), HOST env (default 0.0.0.0)
 ```
 
 The service needs the LLM configuration from `utils/var.env` (`LLM_ENDPOINT`, `LLM_API_KEY`, `LLM_MODEL`, with `OPENAI_*` fallbacks) to actually run research. Check before posting topics:
 
 ```bash
-curl -s localhost:8000/health
+curl -s localhost:8321/health
 # {"service":"multi-agent-rag-researcher","running":false,"deep_configured":true}
 ```
 
@@ -168,15 +168,15 @@ The report endpoint returns exactly what paperbot consumes — the structured `{
 
 ```bash
 # 1. Start a run
-curl -s -X POST localhost:8000/research -H 'content-type: application/json' \
+curl -s -X POST localhost:8321/research -H 'content-type: application/json' \
   -d '{"topic":"What is a vector field","max_rounds":1,"budget_doc":2,"budget_web":1}'
 # → {"task_id":"4bd2c0…","status":"running","current_step":"queued","links":{…}}
 
 # 2. Poll until status becomes "completed"
-curl -s localhost:8000/research/4bd2c0…
+curl -s localhost:8321/research/4bd2c0…
 
 # 3. Fetch the structured report
-curl -s localhost:8000/research/4bd2c0…/report -o report.json
+curl -s localhost:8321/research/4bd2c0…/report -o report.json
 
 # 4. Render with paperbot
 curl -s -X POST -H 'content-type: application/json' -d @report.json \

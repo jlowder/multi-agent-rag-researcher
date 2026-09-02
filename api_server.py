@@ -18,7 +18,7 @@ Routes:
     GET  /health                 -> {service, running, deep_configured}
 
 Run with:  python api_server.py
-Environment:  PORT (default 8000), HOST (default 0.0.0.0)
+Environment:  PORT (default 8321), HOST (default 0.0.0.0)
 """
 
 from __future__ import annotations
@@ -302,11 +302,11 @@ def create_app(
 
 
 def main() -> None:
-    """Run the service with uvicorn (PORT env, default 8000; HOST default 0.0.0.0)."""
+    """Run the service with uvicorn (PORT env, default 8321; HOST default 0.0.0.0)."""
     import uvicorn
 
     host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "8000"))
+    port = int(os.environ.get("PORT", "8321"))
     uvicorn.run(app, host=host, port=port)
 
 
