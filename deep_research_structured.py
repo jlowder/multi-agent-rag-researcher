@@ -316,6 +316,99 @@ def _remap_citations_to_final_sources(report: ResearchReport, registry: dict) ->
     return key_map
 
 
+# Display equation emitted without delimiters: a LaTeX control sequence,
+# no math delimiters, and no prose words once all \command{...} groups,
+# {...} groups, and bare \command tokens are stripped (single-letter
+# variables and ALL-CAPS labels survive; a lowercase run of 2+ vetoes).
+_LATEX_CMD_RE = re.compile(r"\\[a-zA-Z]+\b")
+_COMMAND_GROUP_RE = re.compile(r"\\[a-zA-Z]+\{[^{}]*\}")
+_BRACE_GROUP_RE = re.compile(r"\{[^{}]*\}")
+_BARE_LATEX_CMD_RE = re.compile(r"\\[a-zA-Z]+")
+_LOWERCASE_RUN_RE = re.compile(r"[a-z]{2,}")
+
+
+def _is_bare_equation(text: str) -> bool:
+    """True when a span's text is a display equation the writer emitted
+    without ANY math delimiters (no $ / $ / \\( / \[): it contains a LaTeX
+    control sequence, and after stripping \command{...} groups, {...}
+    groups, and bare \command tokens, no lowercase run of 2+ remains
+    (real prose would). Never raises."""
+    t = (text or "").strip()
+    if not t or "$" in t or "\\(" in t or "\\[" in t:
+        return False
+    if not _LATEX_CMD_RE.search(t):
+        return False
+    s = t
+    while True:
+        stripped = _COMMAND_GROUP_RE.sub(" ", s)
+        stripped = _BRACE_GROUP_RE.sub(" ", stripped)
+        stripped = _BARE_LATEX_CMD_RE.sub(" ", stripped)
+        if stripped == s:
+            break
+        s = stripped
+    return not _LOWERCASE_RUN_RE.search(s)
+
+
+def _promote_bare_equation_spans(report: ResearchReport) -> int:
+    """Promote paragraph spans that are undelimited display equations to
+    standalone equation blocks so downstream renderers (paperbot/KaTeX)
+    typeset them as math instead of printing raw TeX. Mixed paragraphs are
+    split, preserving span order; a paragraph whose spans are all promoted
+    becomes the equation blocks themselves. Never raises.
+
+    Returns the number of promoted spans.
+    """
+    promoted = 0
+    try:
+        for section in report.report.sections:
+            out: list[ReportBlock] = []
+            for block in section.blocks or []:
+                if block.type != "paragraph" or not block.spans:
+                    out.append(block)
+                    continue
+                parts: list[ReportBlock] = []
+                pending: list[Span] = []
+                changed = False
+                for span in block.spans:
+                    if _is_bare_equation(span.text):
+                        if pending:
+                            parts.append(
+                                ReportBlock(
+                                    type="paragraph",
+                                    text=block.text,
+                                    spans=pending,
+                                    citations=list(block.citations),
+                                )
+                            )
+                            pending = []
+                        equation = ReportBlock(
+                            type="equation",
+                            language="latex",
+                            text=span.text,
+                            citations=list(span.citations),
+                        )
+                        equation.spans = []  # text lives in .text, not a span
+                        parts.append(equation)
+                        changed = True
+                        promoted += 1
+                    else:
+                        pending.append(span)
+                if pending:
+                    parts.append(
+                        ReportBlock(
+                            type="paragraph",
+                            text=block.text,
+                            spans=pending,
+                            citations=list(block.citations),
+                        )
+                    )
+                out.extend(parts if changed else [block])
+            section.blocks = out
+    except Exception:
+        pass
+    return promoted
+
+
 def assemble_structured_report(
     *,
     sections: list,
@@ -335,7 +428,8 @@ def assemble_structured_report(
     drop bare-numeric citations, map the cited registry entries to deduped
     Source records (plan §8.1), then renumber citation arrays and rewrite
     [D#]/[W#] text markers onto those final records (plan §6.3 — positions
-    are 1-based into the deduped array, so they never go out of range), and
+    are 1-based into the deduped array, so they never go out of range),
+    promote undelimited display-equation spans to equation blocks, and
     compute quality metrics. `evidence_json` is accepted for interface
     stability and reserved for future provenance fields.
     """
@@ -371,6 +465,7 @@ def assemble_structured_report(
     report.report.sources = [Source.model_validate(d) for d in source_dicts]
 
     _remap_citations_to_final_sources(report, registry)
+    _promote_bare_equation_spans(report)
 
     report.quality.citation_density = compute_citation_density(report)
     report.quality.verification = {
