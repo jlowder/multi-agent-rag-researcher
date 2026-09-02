@@ -11,7 +11,7 @@ The three worker agents are:
 
 ## Key Components
 
-1. A configurable OpenAI-compatible LLM — project default `Ornith-1.0-35B-MLX-oQ8` via a local omlx server — used by all agents, with per-agent model, reasoning-effort, and output-token overrides
+1. A configurable OpenAI-compatible LLM used by all agents, with per-agent model, reasoning-effort, and output-token overrides
 2. Step-by-step function calling that allows the agents to interact with one another
 3. Qdrant vector database for local PDF retrieval
 4. Tavily for web search
