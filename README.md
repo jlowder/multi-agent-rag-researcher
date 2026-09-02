@@ -184,7 +184,7 @@ See the [Configuration](#configuration) section for the full list of supported v
 
 **Note:** See [LOCAL_LLM_SETUP.md](LOCAL_LLM_SETUP.md) for comprehensive configuration examples for Ollama, LocalAI, LM Studio, and other OpenAI-compatible services.
 
-5. Place the PDFs you want to index in the `docs/` folder, or upload PDFs later through the UI. The project ships with five genetic-programming papers in `docs/` (`01_koza_genetic_programming_1992.pdf` through `05_statistical_ml_elements_gp.pdf`), so you can index those directly or replace them with your own documents.
+5. Place the PDFs you want to index in the `docs/` folder, or upload PDFs later through the UI.
 
 ## Run Project
 
@@ -270,8 +270,8 @@ Full reference (all endpoints, step tracking, lifecycle, paperbot integration): 
 
 The live env file is `utils/var.env` (gitignored). It is auto-seeded from `.env.example` on first run, so changes to `.env.example` only affect fresh setups — edit `utils/var.env` to change this project's configuration.
 
-- `LLM_MODEL` — default model for all agents. The project default is `Ornith-1.0-35B-MLX-oQ8` served by a local OpenAI-compatible omlx server (`LLM_ENDPOINT=http://localhost:8080/v1`), which serves several models concurrently.
-- `DECOMPOSER_MODEL` — per-agent model override for deep mode's decomposer only. Its structured schema is produced more reliably by the larger model (`Qwen3-Coder-Next-MLX-6bit` in the project config); every other agent stays on `LLM_MODEL`.
+- `LLM_MODEL` — default model for all agents. 
+- `DECOMPOSER_MODEL` — per-agent model override for deep mode's decomposer only. Its structured schema is produced more reliably by the larger model; every other agent stays on `LLM_MODEL`.
 - Per-agent `*_REASONING_EFFORT` (`low`/`medium`/`high`) and `*_MAX_OUTPUT_TOKENS` for all six agents (`retriever`, `writer`, `verifier`, `orchestrator`, `decomposer`, `sufficiency`). Defaults: writer and verifier run `medium` effort with 16,000 output tokens; retriever, orchestrator, and decomposer run `low` with 2,000; sufficiency runs `low` with 1,000.
 - The four original agents also accept full `*_ENDPOINT`/`*_API_KEY`/`*_MODEL` overrides (the decomposer accepts a model override only).
 - `TAVILY_API_KEY` powers web search; `EMBEDDING_ENDPOINT`/`EMBEDDING_MODEL`/`EMBEDDING_API_KEY` configure chunk embeddings.
