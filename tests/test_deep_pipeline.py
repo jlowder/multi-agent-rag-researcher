@@ -975,6 +975,9 @@ def test_must_revise_empty_section_even_when_critic_all_pass(monkeypatch):
     # One stage-3 draft soft-fails to an EMPTY Section (json mode); the
     # critic says everything is fine. The deterministic must-revise pass
     # must still rewrite the empty section, and the revision ships.
+    # The garbage is returned for BOTH the first attempt (i == 1) and the
+    # writer's no-JSON 2x retry (i == 2), so the section still ends up
+    # empty despite the retry (the retry itself receives garbage).
     def writer_text(i, k):
         if "REVISION REQUIRED" in (k.get("input_data") or ""):
             return json.dumps(
@@ -997,7 +1000,7 @@ def test_must_revise_empty_section_even_when_critic_all_pass(monkeypatch):
                     ],
                 }
             )
-        if i == 1:
+        if i in (1, 2):
             return "garbage, no JSON object here"
         return _json_writer(i)
 
@@ -1020,7 +1023,9 @@ def test_critic_draft_shows_boundary_for_empty_section(monkeypatch):
     critic_inputs = []
 
     def writer_text(i, k):
-        if i == 1:
+        # Garbage for the attempt (i == 1) AND the no-JSON retry (i == 2),
+        # so Section Two really does end up empty for this boundary test.
+        if i in (1, 2):
             return "garbage, no JSON object here"
         return _json_writer(i)
 

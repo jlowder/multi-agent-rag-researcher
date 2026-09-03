@@ -222,11 +222,50 @@ def test_write_section_json_fenced_still_parses(monkeypatch):
 
 
 def test_write_section_json_malformed_falls_back_to_empty(monkeypatch):
-    text = "I will write the section now, but I do not have any JSON on hand."
-    section, _ = _write_section(monkeypatch, text, output_format="json")
+    # Pure prose (brace-free) now triggers the bounded 2x retry: the local
+    # Responses shim never sets incomplete_details and the brace-imbalance
+    # heuristic sees no braces, so without the retry the section would fail
+    # silently. Two prose responses -> retry fires once, then empty section.
+    prose = "I will write the section now, but I do not have any JSON on hand."
+    monkeypatch.setattr(wmod, "get_config", lambda: _FakeConfig())
+    calls = _patch_run_model_seq(
+        monkeypatch, [_FakeResponse(prose), _FakeResponse(prose)]
+    )
+    section = wmod.write_section(
+        user_query="Explain fusion energy",
+        outline="## Definition & Background\n## Synthesis",
+        section_heading="Market",
+        section_context="Cover market dynamics.",
+        evidence_text="[D1] Evidence line one.",
+        output_format="json",
+    )
     assert isinstance(section, Section)
     assert section.heading == "Market"
     assert section.blocks == []
+    assert len(calls) == 2  # exactly one retry
+    assert calls[1]["max_output_tokens"] == 2 * 1000  # 2x the 1000-token config
+
+
+def test_write_section_json_pure_prose_retries_and_recovers(monkeypatch):
+    """Prose on attempt 1, valid JSON on the retry -> a full section, not a
+    silent empty one."""
+    prose = "Here is my analysis of the market. It covers the key dynamics thoroughly."
+    monkeypatch.setattr(wmod, "get_config", lambda: _FakeConfig())
+    calls = _patch_run_model_seq(
+        monkeypatch, [_FakeResponse(prose), _FakeResponse(SECTION_JSON)]
+    )
+    section = wmod.write_section(
+        user_query="Explain fusion energy",
+        outline="## Definition & Background\n## Synthesis",
+        section_heading="Market",
+        section_context="Cover market dynamics.",
+        evidence_text="[D1] Evidence line one.",
+        output_format="json",
+    )
+    assert len(calls) == 2
+    assert calls[1]["max_output_tokens"] == 2000
+    assert len(section.blocks) == 1
+    assert section.blocks[0].spans[0].citations == ["D1"]
 
 
 def test_write_section_json_bad_block_type_falls_back(monkeypatch):
@@ -276,7 +315,11 @@ def test_write_synthesis_json_valid(monkeypatch):
 
 
 def test_write_synthesis_json_malformed_falls_back(monkeypatch):
-    _patch_run_model(monkeypatch, "Just prose, no object anywhere.")
+    # Prose (no braces) triggers the bounded retry; prose again -> empty.
+    prose = "Just prose, no object anywhere."
+    calls = _patch_run_model_seq(
+        monkeypatch, [_FakeResponse(prose), _FakeResponse(prose)]
+    )
     section = wmod.write_synthesis(
         "Explain fusion energy",
         [("Definition & Background", "## Definition & Background\n\nBody [D1].")],
@@ -285,6 +328,7 @@ def test_write_synthesis_json_malformed_falls_back(monkeypatch):
     assert isinstance(section, Section)
     assert section.heading == "Synthesis"
     assert section.blocks == []
+    assert len(calls) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -656,3 +700,68 @@ def test_equation_block_round_trips_through_write_section(monkeypatch):
     assert eq.type.value == "equation"
     assert eq.text == "L = \\sum_i l_i"  # the JSON \sum decodes to one backslash
     assert eq.language == "latex"
+
+
+# ---------------------------------------------------------------------------
+# F. Truncation-signal helper, salvage log level, retry paths
+# ---------------------------------------------------------------------------
+
+def test_has_no_json_content_helper():
+    assert wmod._has_no_json_content("Pure prose, no structure at all.") is True
+    assert wmod._has_no_json_content("") is True
+    assert wmod._has_no_json_content(None) is True
+    assert wmod._has_no_json_content("```json\nstill prose\n```") is True
+    assert wmod._has_no_json_content('{"a": 1}') is False
+    assert wmod._has_no_json_content('broken {"a": ') is False  # braces present
+
+
+def test_premature_close_salvage_logs_info_not_warning(monkeypatch, capsys):
+    """A model that closes the object early then writes the blocks triggers
+    the lossless trailing recovery — that must log INFO, not WARNING."""
+    text = (
+        '{"id": "market", "heading": "Market", "blocks": []}'
+        + ","
+        + '{"type": "paragraph", "spans": [{"text": "' + "x" * 220 + '", "citations": ["D1"]}]}]'
+    )
+    _patch_run_model(monkeypatch, text)
+    section = wmod.write_section(
+        user_query="Explain fusion energy",
+        outline="## Definition & Background\n## Synthesis",
+        section_heading="Market",
+        section_context="Cover market dynamics.",
+        evidence_text="[D1] Evidence line one.",
+        output_format="json",
+        verbose=True,
+    )
+    # The recovery happened and was lossless: the trailing block was kept.
+    assert len(section.blocks) == 1
+    assert section.blocks[0].spans[0].citations == ["D1"]
+    out = capsys.readouterr().out
+    recovered_lines = [ln for ln in out.splitlines() if "recovered" in ln]
+    assert recovered_lines, "salvage line missing"
+    for ln in recovered_lines:
+        assert "INFO" in ln
+        assert "WARNING" not in ln
+
+
+def test_invalid_content_discard_still_warns(monkeypatch, capsys):
+    """Dropping invalid blocks IS a real loss — keep the WARNING there."""
+    text = (
+        '{"id": "market", "heading": "Market", "blocks": ['
+        '{"type": "paragraph", "spans": [{"text": "Good fact.", "citations": ["D1"]}]},'
+        '{"type": "bogus_block", "spans": [{"text": "x", "citations": []}]}]}'
+    )
+    _patch_run_model(monkeypatch, text)
+    section = wmod.write_section(
+        user_query="Explain fusion energy",
+        outline="## Definition & Background\n## Synthesis",
+        section_heading="Market",
+        section_context="Cover market dynamics.",
+        evidence_text="[D1] Evidence line one.",
+        output_format="json",
+        verbose=True,
+    )
+    assert len(section.blocks) == 1  # the valid one kept
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "kept 1 of 2" in out
