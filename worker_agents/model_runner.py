@@ -282,6 +282,22 @@ def run_model(
         request["max_output_tokens"] = max_output_tokens
         logger.debug(f"Added max_output_tokens: {max_output_tokens}")
 
+    # Thinking suppression (chat-template level). The local MLX/omlx server
+    # ignores the SDK's reasoning.effort param AND /no_think prompts (and the
+    # model's ~16K-token generation budget is fixed, so a thinking trace
+    # silently truncates the JSON contract output — 58K-char critic dumps,
+    # 27-word syntheses). The one lever the server honors is the Qwen
+    # chat-template kwarg via extra_body; it is a no-op for non-thinking
+    # models, so it is sent unconditionally (default False; re-enable with
+    # LLM_ENABLE_THINKING=true). Existing extra_body fields are preserved.
+    config = get_config()
+    extra_body = dict(request.get("extra_body") or {})
+    chat_template_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
+    chat_template_kwargs["enable_thinking"] = config.enable_thinking
+    extra_body["chat_template_kwargs"] = chat_template_kwargs
+    request["extra_body"] = extra_body
+    logger.debug(f"Added extra_body.chat_template_kwargs.enable_thinking: {config.enable_thinking}")
+
     logger.debug("=" * 80)
     logger.debug("FINAL REQUEST DICT (about to send to API):")
     logger.debug(f"  model: '{request['model']}' (type: {type(request['model']).__name__})")
@@ -295,6 +311,8 @@ def run_model(
         logger.debug(f"  reasoning: {request['reasoning']}")
     if "max_output_tokens" in request:
         logger.debug(f"  max_output_tokens: {request['max_output_tokens']}")
+    if "extra_body" in request:
+        logger.debug(f"  extra_body: {request['extra_body']}")
     logger.debug("=" * 80)
 
     if text_format is not None:

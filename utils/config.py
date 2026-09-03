@@ -152,6 +152,16 @@ class Config:
     # truncate the payload itself.
     sufficiency_max_output_tokens: int = 2000
 
+    # Thinking suppression (chat-template level): forwarded to the LLM as
+    # extra_body.chat_template_kwargs.enable_thinking on every run_model
+    # call. Default False — thinking models (Ornith/Qwen on the local
+    # MLX/omlx server) burn the model's fixed ~16K-token generation budget
+    # on reasoning traces, which truncates the JSON contract output (the
+    # SDK's reasoning.effort and /no_think are ignored by that server).
+    # Harmless no-op for non-thinking models. LLM_ENABLE_THINKING=true
+    # re-enables thinking (8-10x slower).
+    enable_thinking: bool = False
+
     # Deep-mode evidence cache (P2-2): reuse previously retrieved
     # per-sub-question evidence within the TTL instead of re-retrieving.
     # Disable with EVIDENCE_CACHE_ENABLED=false.
@@ -274,6 +284,9 @@ def get_config() -> Config:
             orchestrator_max_output_tokens=int(os.getenv("ORCHESTRATOR_MAX_OUTPUT_TOKENS", "2000")),
             decomposer_max_output_tokens=int(os.getenv("DECOMPOSER_MAX_OUTPUT_TOKENS", "2000")),
             sufficiency_max_output_tokens=int(os.getenv("SUFFICIENCY_MAX_OUTPUT_TOKENS", "2000")),
+            enable_thinking=os.getenv(
+                "LLM_ENABLE_THINKING", "false"
+            ).strip().lower() in ("1", "true", "yes", "on"),
             evidence_cache_enabled=os.getenv(
                 "EVIDENCE_CACHE_ENABLED", "true"
             ).strip().lower() in ("1", "true", "yes", "on"),
@@ -433,7 +446,16 @@ WRITER_MAX_OUTPUT_TOKENS=16000
 VERIFIER_MAX_OUTPUT_TOKENS=16000
 ORCHESTRATOR_MAX_OUTPUT_TOKENS=2000
 DECOMPOSER_MAX_OUTPUT_TOKENS=2000
-SUFFICIENCY_MAX_OUTPUT_TOKENS=1000
+SUFFICIENCY_MAX_OUTPUT_TOKENS=2000
+
+# ----------------------------------------
+# Thinking Mode (optional)
+# ----------------------------------------
+# Forwarded to the LLM as chat_template_kwargs.enable_thinking.
+# Default off: thinking traces burn the model's fixed output budget and
+# truncate JSON output (Ornith/Qwen on the local MLX server). true =
+# visible reasoning, ~8-10x slower.
+LLM_ENABLE_THINKING=false
 
 # ----------------------------------------
 # Deep-Mode Evidence Cache (optional)

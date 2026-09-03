@@ -153,6 +153,27 @@ def test_parse_failure_logs_sanitized_snippet(monkeypatch, caplog):
     assert all("\n" not in m for m in messages)
 
 
+def test_extra_body_thinking_suppressed_by_default(monkeypatch):
+    """run_model sends chat_template_kwargs.enable_thinking=False by default
+    (config default), coexisting with — not clobbering — reasoning.effort."""
+    client = _install(monkeypatch, "ok")
+    run_model(instructions="x", input_data="y", model="m", reasoning_effort="low")
+    call = client.calls[0]
+    assert call["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert call["reasoning"] == {"effort": "low"}
+
+
+def test_extra_body_thinking_enabled_via_config(monkeypatch):
+    """LLM_ENABLE_THINKING=true (config.enable_thinking=True) is forwarded."""
+    client = _install(monkeypatch, "ok")
+    monkeypatch.setattr(
+        model_runner, "get_config", lambda: SimpleNamespace(enable_thinking=True)
+    )
+    run_model(instructions="x", input_data="y", model="m")
+    call = client.calls[0]
+    assert call["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
+
+
 def test_sanitize_output_snippet_head_tail_elision():
     from worker_agents.model_runner import _sanitize_output_snippet
 
