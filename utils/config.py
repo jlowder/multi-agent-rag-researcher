@@ -147,7 +147,10 @@ class Config:
     verifier_max_output_tokens: int = 16000
     orchestrator_max_output_tokens: int = 2000
     decomposer_max_output_tokens: int = 2000
-    sufficiency_max_output_tokens: int = 1000
+    # 2000 (was 1000): chatty local models spend part of the budget on
+    # preamble/postamble around the small sufficiency JSON, and 1000 could
+    # truncate the payload itself.
+    sufficiency_max_output_tokens: int = 2000
 
     # Deep-mode evidence cache (P2-2): reuse previously retrieved
     # per-sub-question evidence within the TTL instead of re-retrieving.
@@ -270,7 +273,7 @@ def get_config() -> Config:
             verifier_max_output_tokens=int(os.getenv("VERIFIER_MAX_OUTPUT_TOKENS", "16000")),
             orchestrator_max_output_tokens=int(os.getenv("ORCHESTRATOR_MAX_OUTPUT_TOKENS", "2000")),
             decomposer_max_output_tokens=int(os.getenv("DECOMPOSER_MAX_OUTPUT_TOKENS", "2000")),
-            sufficiency_max_output_tokens=int(os.getenv("SUFFICIENCY_MAX_OUTPUT_TOKENS", "1000")),
+            sufficiency_max_output_tokens=int(os.getenv("SUFFICIENCY_MAX_OUTPUT_TOKENS", "2000")),
             evidence_cache_enabled=os.getenv(
                 "EVIDENCE_CACHE_ENABLED", "true"
             ).strip().lower() in ("1", "true", "yes", "on"),

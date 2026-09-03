@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 from .model_runner import run_model
 from utils.config import get_config
+from utils.json_extract import extract_json_payload
 
 logger = logging.getLogger(__name__)
 
@@ -117,21 +118,13 @@ def _fallback_plan(user_query: str, source: str = "fallback") -> Dict[str, Any]:
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     """Best-effort extraction of a JSON object embedded in raw text.
 
-    Uses raw_decode starting at the first '{', so preamble prose and any
-    trailing data after the plan object (models sometimes append more text
-    or a second blob) do not break extraction. Returns None on any failure;
-    never raises.
+    Delegates to the shared utils.json_extract extractor, so preamble
+    prose, a markdown fence, decoy objects in the preamble (largest
+    decoded span wins), and any trailing data after the plan object do
+    not break extraction. Returns None on any failure; never raises.
     """
-    if not text:
-        return None
-    start = text.find("{")
-    if start == -1:
-        return None
-    try:
-        obj, _end = json.JSONDecoder().raw_decode(text[start:])
-    except json.JSONDecodeError:
-        return None
-    return obj if isinstance(obj, dict) else None
+    value = extract_json_payload(text)
+    return value if isinstance(value, dict) else None
 
 
 def _ensure_ids(data: Dict[str, Any]) -> Dict[str, Any]:

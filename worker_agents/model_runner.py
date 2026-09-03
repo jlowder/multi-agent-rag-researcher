@@ -27,6 +27,31 @@ from utils.config import (
     get_config,
     reset_config,
 )
+from utils.json_extract import extract_json_payload
+
+# The SDK's own text-format builder (private but stable across openai 2.x):
+# converts a pydantic model into the strict json_schema text.format the
+# Responses API expects.
+try:
+    from openai.lib._parsing._responses import type_to_text_format_param
+except ImportError:  # pragma: no cover - SDK layout drift
+    type_to_text_format_param = None
+
+
+def _text_format_param(text_format: Any) -> Dict[str, Any]:
+    """Strict json_schema text.format entry for a pydantic text_format model."""
+    if type_to_text_format_param is not None:
+        try:
+            return type_to_text_format_param(text_format)
+        except Exception:
+            pass
+    schema = text_format.model_json_schema()
+    return {
+        "type": "json_schema",
+        "strict": True,
+        "name": schema.get("title") or "structured_output",
+        "schema": schema,
+    }
 
 
 def _normalize_endpoint_url(endpoint: str) -> str:
@@ -225,11 +250,16 @@ def run_model(
     logger.info("=" * 80)
     
     if text_format is not None:
-        logger.info("Calling client.responses.parse() with structured output")
-        response = client.responses.parse(**request, text_format=text_format)
+        # Send the strict schema for servers that honor text.format (the
+        # local MLX server ignores it), but call .create — NOT .parse: the
+        # SDK's parse runs model_validate_json on the FULL raw text
+        # client-side and raises on any conversational preamble, before any
+        # agent fallback can see the raw output.
+        request["text"] = {"format": _text_format_param(text_format)}
+        logger.info("Calling client.responses.create() with structured output")
     else:
         logger.info("Calling client.responses.create()")
-        response = client.responses.create(**request)
+    response = client.responses.create(**request)
     # The local MLX server occasionally returns a response whose `output`
     # is None (model glitch); reading .output_text on it raises TypeError.
     # Normalize to an empty list so every caller's fallback path engages
@@ -241,6 +271,21 @@ def run_model(
             f"(model={request.get('model')}); normalizing to empty output"
         )
         response.output = []
+
+    if text_format is not None:
+        # Tolerant client-side parse: recover the JSON payload from whatever
+        # the server actually returned (preamble/postamble/fences) and
+        # validate it. Invariant: never raises on malformed or preambled
+        # content — output_parsed is the validated model on success, None
+        # otherwise, so callers run their existing fallbacks. The raw
+        # output_text is preserved untouched for those fallbacks.
+        try:
+            response.output_parsed = text_format.model_validate(
+                extract_json_payload(getattr(response, "output_text", "") or "")
+            )
+        except Exception:
+            response.output_parsed = None
+
     return response
 
 
