@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -52,6 +53,33 @@ def _text_format_param(text_format: Any) -> Dict[str, Any]:
         "name": schema.get("title") or "structured_output",
         "schema": schema,
     }
+
+
+# Credential-shaped strings that must never reach a log line verbatim.
+_SECRET_RE = re.compile(
+    r"sk-[A-Za-z0-9_\-]{8,}"
+    r"|omlx-[A-Za-z0-9_\-]{8,}"
+    r"|\bBearer\s+[A-Za-z0-9._\-]{8,}"
+    r"|\b(api[_\-]?key|token|secret|authorization|password)[\"']?\s*[:=]\s*[\"']?[\w.\-]{6,}"
+)
+
+
+def _sanitize_output_snippet(text: str, limit: int = 160) -> str:
+    """One-line, credential-redacted snippet of raw LLM output for log lines.
+
+    Newlines become literal "\\n", tabs literal "\\t", other control
+    characters are dropped, and anything that looks like an API key / token
+    / secret is replaced with [REDACTED]. Purely cosmetic; never raises.
+    """
+    if not text:
+        return "(empty)"
+    one_line = text.replace("\r", "").replace("\t", "\\t").replace("\n", "\\n")
+    one_line = re.sub(r"[\x00-\x1f\x7f]+", " ", one_line)
+    one_line = _SECRET_RE.sub("[REDACTED]", one_line)
+    one_line = re.sub(r"\s{2,}", " ", one_line).strip()
+    if len(one_line) > limit:
+        one_line = one_line[:limit].rstrip() + "…"
+    return one_line or "(whitespace only)"
 
 
 def _normalize_endpoint_url(endpoint: str) -> str:
@@ -285,6 +313,18 @@ def run_model(
             )
         except Exception:
             response.output_parsed = None
+            # Diagnostic only: every text_format parse failure shows what
+            # the model actually emitted (sanitized to one line, secrets
+            # redacted) so "could not be parsed" warnings are debuggable.
+            raw_text = getattr(response, "output_text", "") or ""
+            logger.warning(
+                "no structured output on response (text_format=%s, model=%s, "
+                "raw output_text %d chars, starts: %s)",
+                getattr(text_format, "__name__", str(text_format)),
+                request.get("model"),
+                len(raw_text),
+                _sanitize_output_snippet(raw_text),
+            )
 
     return response
 

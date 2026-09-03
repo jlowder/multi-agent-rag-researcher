@@ -9,6 +9,7 @@ and validates a shared-extractor recovery of the JSON payload, so it must:
 """
 
 import json
+import logging
 from types import SimpleNamespace
 from typing import Any, List, Optional
 
@@ -124,3 +125,36 @@ def test_output_none_glitch_still_normalized(monkeypatch):
     )
     assert response.output == []
     assert response.output_parsed is None
+
+
+def test_parse_failure_logs_sanitized_snippet(monkeypatch, caplog):
+    text = (
+        "Let me think about this.\n"
+        'api_key: omlx-abcdef123456789\n'
+        '{"is_supported": true, "notes": "x"\n'
+    )
+    _install(monkeypatch, text)
+    with caplog.at_level(logging.WARNING, logger="worker_agents.model_runner"):
+        run_model(instructions="x", input_data="y", model="m", text_format=_ParseModel)
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    joined = " | ".join(messages)
+    assert "no structured output on response" in joined
+    assert "omlx-abcdef123456789" not in joined
+    assert "[REDACTED]" in joined
+    assert "Let me think about this." in joined
+    # One log line: the newline is shown literally, never raw.
+    assert "\\n" in joined
+    assert all("\n" not in m for m in messages)
+
+
+def test_sanitize_output_snippet_escaping_truncation_redaction():
+    from worker_agents.model_runner import _sanitize_output_snippet
+
+    out = _sanitize_output_snippet("line1\nline2\ttab" + "x" * 500)
+    assert "\n" not in out and "\t" not in out
+    assert "\\n" in out and "\\t" in out
+    assert len(out) <= 161  # 160 chars + ellipsis
+    out2 = _sanitize_output_snippet('"api_key": "sk-abcdefghijklmnop"\nmore')
+    assert "sk-abcdefghijklmnop" not in out2
+    assert "[REDACTED]" in out2
+    assert _sanitize_output_snippet("") == "(empty)"
