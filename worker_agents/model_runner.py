@@ -64,22 +64,40 @@ _SECRET_RE = re.compile(
 )
 
 
-def _sanitize_output_snippet(text: str, limit: int = 160) -> str:
-    """One-line, credential-redacted snippet of raw LLM output for log lines.
+def _sanitize_span(span: str) -> str:
+    """Escape control chars and redact credential-shaped strings; never raises."""
+    one_line = span.replace("\r", "").replace("\t", "\\t").replace("\n", "\\n")
+    one_line = re.sub(r"[\x00-\x1f\x7f]+", " ", one_line)
+    one_line = _SECRET_RE.sub("[REDACTED]", one_line)
+    return re.sub(r"\s{2,}", " ", one_line).strip()
 
-    Newlines become literal "\\n", tabs literal "\\t", other control
-    characters are dropped, and anything that looks like an API key / token
-    / secret is replaced with [REDACTED]. Purely cosmetic; never raises.
+
+def _sanitize_output_snippet(
+    text: str, head_limit: int = 120, tail_limit: int = 80, full_limit: int = 200
+) -> str:
+    """One-line snippet of raw LLM output for parse-failure warnings.
+
+    Shows BOTH ends of the output — first ~120 chars and last ~80 chars,
+    joined by " …[N chars elided]… " (N = raw middle chars omitted) — so a
+    failed parse exposes start-malformations (e.g. unquoted keys at char 1)
+    AND end-truncation (unclosed JSON); the elided count makes
+    suspiciously-short totals (token-cap cuts) visible. Output of
+    <= full_limit chars is logged whole, without elision. Newlines/tabs are
+    shown literally (one log line) and credential-shaped strings become
+    [REDACTED] (re-checked across the assembled snippet, so secrets
+    straddling the head/tail seam are caught too). Purely cosmetic; never
+    raises.
     """
     if not text:
         return "(empty)"
-    one_line = text.replace("\r", "").replace("\t", "\\t").replace("\n", "\\n")
-    one_line = re.sub(r"[\x00-\x1f\x7f]+", " ", one_line)
-    one_line = _SECRET_RE.sub("[REDACTED]", one_line)
-    one_line = re.sub(r"\s{2,}", " ", one_line).strip()
-    if len(one_line) > limit:
-        one_line = one_line[:limit].rstrip() + "…"
-    return one_line or "(whitespace only)"
+    if len(text) <= full_limit:
+        return _sanitize_span(text) or "(whitespace only)"
+    head_n = min(head_limit, len(text))
+    tail_n = min(tail_limit, len(text) - head_n)
+    elided = len(text) - head_n - tail_n
+    head = _sanitize_span(text[:head_n]).rstrip()
+    tail = _sanitize_span(text[len(text) - tail_n:]).lstrip()
+    return _SECRET_RE.sub("[REDACTED]", f"{head} …[{elided} chars elided]… {tail}")
 
 
 def _normalize_endpoint_url(endpoint: str) -> str:

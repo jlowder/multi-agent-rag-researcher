@@ -10,6 +10,7 @@ and validates a shared-extractor recovery of the JSON payload, so it must:
 
 import json
 import logging
+import re
 from types import SimpleNamespace
 from typing import Any, List, Optional
 
@@ -132,7 +133,9 @@ def test_parse_failure_logs_sanitized_snippet(monkeypatch, caplog):
         "Let me think about this.\n"
         'api_key: omlx-abcdef123456789\n'
         '{"is_supported": true, "notes": "x"\n'
+        "The evidence covers the mechanisms thoroughly. " * 3
     )
+    assert len(text) > 200  # long path: head + elision + tail
     _install(monkeypatch, text)
     with caplog.at_level(logging.WARNING, logger="worker_agents.model_runner"):
         run_model(instructions="x", input_data="y", model="m", text_format=_ParseModel)
@@ -142,19 +145,37 @@ def test_parse_failure_logs_sanitized_snippet(monkeypatch, caplog):
     assert "omlx-abcdef123456789" not in joined
     assert "[REDACTED]" in joined
     assert "Let me think about this." in joined
+    # Head, elision marker with exact raw count, and tail all present.
+    assert f"…[{len(text) - 120 - 80} chars elided]…" in joined
+    assert "thoroughly." in joined  # tail end of the raw output
     # One log line: the newline is shown literally, never raw.
     assert "\\n" in joined
     assert all("\n" not in m for m in messages)
 
 
-def test_sanitize_output_snippet_escaping_truncation_redaction():
+def test_sanitize_output_snippet_head_tail_elision():
     from worker_agents.model_runner import _sanitize_output_snippet
 
-    out = _sanitize_output_snippet("line1\nline2\ttab" + "x" * 500)
-    assert "\n" not in out and "\t" not in out
-    assert "\\n" in out and "\\t" in out
-    assert len(out) <= 161  # 160 chars + ellipsis
-    out2 = _sanitize_output_snippet('"api_key": "sk-abcdefghijklmnop"\nmore')
+    # Short input (<= 200 chars): whole text, no elision.
+    out = _sanitize_output_snippet("line1\nline2\ttab")
+    assert out == "line1\\nline2\\ttab"
+    assert "chars elided" not in out
+
+    # Long input: head + marker + tail; N = raw middle chars omitted.
+    text = "HEAD-MARKER " + "x" * 1000 + "TAIL-MARKER"
+    out = _sanitize_output_snippet(text)
+    assert out.startswith("HEAD-MARKER")
+    assert out.endswith("TAIL-MARKER")
+    match = re.search(r"…\[(\d+) chars elided\]…", out)
+    assert match is not None
+    assert int(match.group(1)) == len(text) - 120 - 80
+    assert out.count("chars elided") == 1
+
+    # Planted secret (in the head) is redacted; tail survives intact.
+    text2 = "api_key: sk-abcdefghijklmnop" + "y" * 1000 + "TAIL2"
+    out2 = _sanitize_output_snippet(text2)
     assert "sk-abcdefghijklmnop" not in out2
     assert "[REDACTED]" in out2
+    assert out2.endswith("TAIL2")
+
     assert _sanitize_output_snippet("") == "(empty)"
