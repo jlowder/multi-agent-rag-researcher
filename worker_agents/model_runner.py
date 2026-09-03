@@ -10,9 +10,11 @@ from openai import OpenAI
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+logging.disable(logging.DEBUG)
 
 # Compute UTILS_DIR before any imports that depend on it
 UTILS_DIR = Path(__file__).resolve().parents[1] / "utils"
@@ -103,23 +105,23 @@ def _sanitize_output_snippet(
 def _normalize_endpoint_url(endpoint: str) -> str:
     """
     Normalize an endpoint URL to ensure consistent formatting.
-    
+
     Args:
         endpoint: The endpoint URL to normalize
-        
+
     Returns:
         Normalized endpoint URL with trailing slash removed
     """
     # Strip trailing slashes for consistency
     normalized = endpoint.rstrip('/')
-    
+
     # Check for existing scheme properly
     if not (normalized.startswith('http://') or normalized.startswith('https://')):
         if ':' in normalized or '/' in normalized:
             normalized = f"http://{normalized}"
         else:
             normalized = f"https://{normalized}"
-    
+
     return normalized
 
 
@@ -130,12 +132,12 @@ def get_client(
 ) -> OpenAI:
     """
     Get an OpenAI client for the specified endpoint.
-    
+
     Args:
         endpoint: The base URL for the LLM API. If None, uses default endpoint.
         api_key: The API key for authentication. If None, uses default API key.
         agent_name: If provided, uses the agent-specific configuration.
-        
+
     Returns:
         An OpenAI client instance
     """
@@ -148,11 +150,11 @@ def get_client(
         config = get_config()
         endpoint = endpoint or config.default_endpoint
         api_key = api_key or config.default_api_key
-    
+
     # Normalize endpoint for consistent caching
     if endpoint:
         endpoint = _normalize_endpoint_url(endpoint)
-    
+
     return get_client_for_endpoint(endpoint, api_key)
 
 
@@ -179,7 +181,7 @@ def run_model(
 ):
     """
     Run an LLM model with the given parameters.
-    
+
     Args:
         instructions: System instructions for the model
         input_data: Input data to process
@@ -193,70 +195,70 @@ def run_model(
         endpoint: Custom endpoint URL (overrides default)
         api_key: Custom API key (overrides default)
         agent_name: Agent name to use configuration from (e.g., "retriever", "writer")
-        
+
     Returns:
         The model response
     """
     logger = logging.getLogger(__name__)
-    
+
     # ============================================
     # STEP 1: Log incoming parameters
     # ============================================
-    logger.info("=" * 80)
-    logger.info("RUN_MODEL CALLED WITH PARAMETERS:")
-    logger.info(f"  instructions length: {len(instructions)} chars")
-    logger.info(f"  input_data type: {type(input_data).__name__}")
+    logger.debug("=" * 80)
+    logger.debug("RUN_MODEL CALLED WITH PARAMETERS:")
+    logger.debug(f"  instructions length: {len(instructions)} chars")
+    logger.debug(f"  input_data type: {type(input_data).__name__}")
     if isinstance(input_data, str):
-        logger.info(f"  input_data preview: {input_data[:100]}...")
-    logger.info(f"  tools: {len(tools) if tools else 0} tools")
-    logger.info(f"  previous_response_id: {previous_response_id}")
-    logger.info(f"  model (incoming): {model} (type: {type(model).__name__ if model is not None else 'NoneType'})")
-    logger.info(f"  reasoning_effort: {reasoning_effort}")
-    logger.info(f"  max_output_tokens: {max_output_tokens}")
-    logger.info(f"  text_format: {text_format}")
-    logger.info(f"  endpoint: {endpoint}")
-    logger.info(f"  api_key: {'***' if api_key else '(none)'}")
-    logger.info(f"  agent_name: {agent_name}")
-    logger.info("=" * 80)
-    
+        logger.debug(f"  input_data preview: {input_data[:100]}...")
+    logger.debug(f"  tools: {len(tools) if tools else 0} tools")
+    logger.debug(f"  previous_response_id: {previous_response_id}")
+    logger.debug(f"  model (incoming): {model} (type: {type(model).__name__ if model is not None else 'NoneType'})")
+    logger.debug(f"  reasoning_effort: {reasoning_effort}")
+    logger.debug(f"  max_output_tokens: {max_output_tokens}")
+    logger.debug(f"  text_format: {text_format}")
+    logger.debug(f"  endpoint: {endpoint}")
+    logger.debug(f"  api_key: {'***' if api_key else '(none)'}")
+    logger.debug(f"  agent_name: {agent_name}")
+    logger.debug("=" * 80)
+
     # Get client based on parameters
     client = get_client(endpoint=endpoint, api_key=api_key, agent_name=agent_name)
-    
+
     # ============================================
     # STEP 2: Get model name from agent_name if model is None
     # ============================================
     if model is None and agent_name:
-        logger.info(f"Model is None, looking up config for agent_name: '{agent_name}'")
+        logger.debug(f"Model is None, looking up config for agent_name: '{agent_name}'")
         config = get_config()
         agent_config = config.get_agent_config(agent_name)
-        logger.info(f"Agent config retrieved:")
-        logger.info(f"  endpoint: {agent_config.endpoint}")
-        logger.info(f"  model: {agent_config.model} (type: {type(agent_config.model).__name__})")
-        logger.info(f"  api_key: {'***' if agent_config.api_key else '(none)'}")
+        logger.debug(f"Agent config retrieved:")
+        logger.debug(f"  endpoint: {agent_config.endpoint}")
+        logger.debug(f"  model: {agent_config.model} (type: {type(agent_config.model).__name__})")
+        logger.debug(f"  api_key: {'***' if agent_config.api_key else '(none)'}")
         model = agent_config.model
-    
+
     # ============================================
     # STEP 3: Fallback to default model if still None
     # ============================================
     if model is None:
-        logger.warning("Model is still None after agent_name lookup, using default_model")
+        logger.debug("Model is still None after agent_name lookup, using default_model")
         config = get_config()
         model = config.default_model
-        logger.info(f"Using default_model: {model} (type: {type(model).__name__})")
-    
+        logger.debug(f"Using default_model: {model} (type: {type(model).__name__})")
+
     # ============================================
     # STEP 4: Validate model is a string
     # ============================================
     if not isinstance(model, str):
         logger.error(f"CRITICAL: Model is not a string! Type: {type(model)}, Value: {model}")
         raise ValueError(f"Model must be a non-empty string, got: {type(model)} - {model}")
-    
+
     if not model:
         logger.error("CRITICAL: Model is an empty string!")
         raise ValueError("Model must be a non-empty string, got empty string")
-    
-    logger.info(f"VALIDATED: model is a valid string: '{model}'")
-    
+
+    logger.debug(f"VALIDATED: model is a valid string: '{model}'")
+
     # ============================================
     # STEP 5: Build request dictionary
     # ============================================
@@ -271,30 +273,30 @@ def run_model(
         previous_response_id=previous_response_id,
         parallel_tool_calls=False,
     )
-    
+
     if reasoning_effort:
         request["reasoning"] = {"effort": reasoning_effort}
-        logger.info(f"Added reasoning_effort: {reasoning_effort}")
-    
+        logger.debug(f"Added reasoning_effort: {reasoning_effort}")
+
     if max_output_tokens is not None:
         request["max_output_tokens"] = max_output_tokens
-        logger.info(f"Added max_output_tokens: {max_output_tokens}")
-    
-    logger.info("=" * 80)
-    logger.info("FINAL REQUEST DICT (about to send to API):")
-    logger.info(f"  model: '{request['model']}' (type: {type(request['model']).__name__})")
-    logger.info(f"  instructions length: {len(request['instructions'])} chars")
-    logger.info(f"  input type: {type(request['input']).__name__}")
-    logger.info(f"  tools count: {len(request['tools'])}")
-    logger.info(f"  tool_choice: {request['tool_choice']}")
-    logger.info(f"  previous_response_id: {request['previous_response_id']}")
-    logger.info(f"  parallel_tool_calls: {request['parallel_tool_calls']}")
+        logger.debug(f"Added max_output_tokens: {max_output_tokens}")
+
+    logger.debug("=" * 80)
+    logger.debug("FINAL REQUEST DICT (about to send to API):")
+    logger.debug(f"  model: '{request['model']}' (type: {type(request['model']).__name__})")
+    logger.debug(f"  instructions length: {len(request['instructions'])} chars")
+    logger.debug(f"  input type: {type(request['input']).__name__}")
+    logger.debug(f"  tools count: {len(request['tools'])}")
+    logger.debug(f"  tool_choice: {request['tool_choice']}")
+    logger.debug(f"  previous_response_id: {request['previous_response_id']}")
+    logger.debug(f"  parallel_tool_calls: {request['parallel_tool_calls']}")
     if "reasoning" in request:
-        logger.info(f"  reasoning: {request['reasoning']}")
+        logger.debug(f"  reasoning: {request['reasoning']}")
     if "max_output_tokens" in request:
-        logger.info(f"  max_output_tokens: {request['max_output_tokens']}")
-    logger.info("=" * 80)
-    
+        logger.debug(f"  max_output_tokens: {request['max_output_tokens']}")
+    logger.debug("=" * 80)
+
     if text_format is not None:
         # Send the strict schema for servers that honor text.format (the
         # local MLX server ignores it), but call .create — NOT .parse: the
@@ -302,9 +304,9 @@ def run_model(
         # client-side and raises on any conversational preamble, before any
         # agent fallback can see the raw output.
         request["text"] = {"format": _text_format_param(text_format)}
-        logger.info("Calling client.responses.create() with structured output")
+        logger.debug("Calling client.responses.create() with structured output")
     else:
-        logger.info("Calling client.responses.create()")
+        logger.debug("Calling client.responses.create()")
     response = client.responses.create(**request)
     # The local MLX server occasionally returns a response whose `output`
     # is None (model glitch); reading .output_text on it raises TypeError.
