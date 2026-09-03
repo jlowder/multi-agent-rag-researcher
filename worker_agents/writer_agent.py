@@ -1,6 +1,7 @@
 from .model_runner import run_model
 from typing import Any, Optional
 from utils.config import get_config
+from utils.json_extract import extract_json_payload_span
 import json
 import re
 from datetime import datetime, timezone
@@ -66,54 +67,21 @@ def _extract_json_object_span(text: str) -> tuple[dict | None, int]:
     """Extract a single JSON object from a model response (best-effort),
     returning (object, end-offset).
 
-    Strips ```json/``` code fences if the whole response is fenced, then
-    tries to raw_decode a JSON value at EVERY "{" index and collects the
-    dicts that parse. (The old first-"{"→last-"}" slice silently returned
-    None when prose around the JSON contained braces, or when two objects
-    appeared.) When any parsed dict contains a "blocks" or "heading" key
-    the LARGEST such dict (by decoded span) is returned — a prose decoy
-    like `example: {"heading": "wrong"}` may precede the real section —
-    otherwise the first parsed dict. Returns (None, -1) when nothing
+    Delegates to the shared utils.json_extract extractor (single source of
+    truth for preamble/fence-tolerant JSON recovery) with the writer's
+    preferred keys: among top-level objects, one carrying "blocks" or
+    "heading" wins (largest decoded span) — a prose decoy like
+    `example: {"heading": "wrong"}` may precede the real section —
+    otherwise the first top-level object wins, exactly as the original
+    object-only implementation did. Returns (None, -1) when no object
     parses (soft-fail). The end offset is the position in the stripped
     (de-fenced) text where the chosen object's decode ended, for
     post-object premature-close recovery.
     """
-    if not text:
+    value, end = extract_json_payload_span(text, prefer_keys=("blocks", "heading"))
+    if value is None or not isinstance(value, dict):
         return None, -1
-    candidate = text.strip()
-    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, re.DOTALL)
-    if fence:
-        candidate = fence.group(1).strip()
-    parsed: list[tuple[dict, int, int]] = []
-    spans: list[tuple[int, int]] = []
-    for i, ch in enumerate(candidate):
-        if ch != "{":
-            continue
-        try:
-            obj, end = _JSON_DECODER.raw_decode(candidate, i)
-        except ValueError:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        # Skip objects nested INSIDE an earlier-parsed object: when the
-        # response holds one top-level object, its inner dicts are parts of
-        # it, not competing objects (e.g. a report's section entries must
-        # not be preferred over the report itself).
-        if any(start <= i < e for start, e in spans):
-            continue
-        parsed.append((obj, i, end))
-        spans.append((i, end))
-    if not parsed:
-        return None, -1
-    # Prefer the LARGEST key-bearing dict (decoded span), not the first:
-    # a prose decoy like `example: {"heading": "wrong"}` may appear before
-    # the real section, and first-wins would let it steal the response.
-    keyed = [p for p in parsed if "blocks" in p[0] or "heading" in p[0]]
-    if keyed:
-        obj, _start, end = max(keyed, key=lambda p: p[2] - p[1])
-    else:
-        obj, _start, end = parsed[0]
-    return obj, end
+    return value, end
 
 
 def _extract_json_object(text: str) -> dict | None:
