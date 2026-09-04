@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timezone
 
 from models import (
+    BlockType,
     Report,
     ResearchReport,
     ReportBlock,
@@ -429,9 +430,10 @@ def assemble_structured_report(
     Source records (plan §8.1), then renumber citation arrays and rewrite
     [D#]/[W#] text markers onto those final records (plan §6.3 — positions
     are 1-based into the deduped array, so they never go out of range),
-    promote undelimited display-equation spans to equation blocks, and
-    compute quality metrics. `evidence_json` is accepted for interface
-    stability and reserved for future provenance fields.
+    promote undelimited display-equation spans to equation blocks, normalize
+    comparison_table row widths to the header, and compute quality metrics.
+    `evidence_json` is accepted for interface stability and reserved for
+    future provenance fields.
     """
     report = ResearchReport(
         schema_version="1.0",
@@ -466,6 +468,7 @@ def assemble_structured_report(
 
     _remap_citations_to_final_sources(report, registry)
     _promote_bare_equation_spans(report)
+    _normalize_comparison_table_widths(report)
 
     report.quality.citation_density = compute_citation_density(report)
     report.quality.verification = {
@@ -507,6 +510,46 @@ def _collapse_adjacent_duplicate_blocks(report: ResearchReport) -> None:
             section.blocks = kept
     except Exception:
         pass
+
+
+def _normalize_comparison_table_widths(report: ResearchReport) -> int:
+    """Make every comparison_table row as wide as its header, in place.
+
+    Ragged tables (a row with fewer or more cells than ``len(columns)``)
+    pass the schema — there is no width constraint — but they break
+    downstream consumers that index rows up to the header width (paperbot's
+    normalizer crashed reading ``row[i]`` on a 3-column table whose rows
+    carried 2 cells). Short rows are padded with empty cells, over-long rows
+    truncated, and non-Span cells coerced to spans so every cell keeps the
+    ``.text``/``.citations`` shape the plain-text and quality helpers read
+    (a raw ``""`` cell would read fine in paperbot but AttributeError in
+    ``sections_plain_text``). Tables with no columns are left untouched.
+    Never raises. Returns the number of rows modified.
+    """
+    changed = 0
+    try:
+        for section in report.report.sections:
+            for block in section.blocks or []:
+                if block.type != BlockType.comparison_table:
+                    continue
+                width = len(block.columns or [])
+                if width == 0 or not isinstance(block.rows, list):
+                    continue
+                for i, row in enumerate(block.rows):
+                    cells = [
+                        cell if isinstance(cell, Span) else Span(text=str(cell), citations=[])
+                        for cell in row
+                    ] if isinstance(row, list) else []
+                    if len(cells) < width:
+                        cells += [Span(text="", citations=[]) for _ in range(width - len(cells))]
+                    elif len(cells) > width:
+                        cells = cells[:width]
+                    if cells != row:
+                        block.rows[i] = cells
+                        changed += 1
+    except Exception:
+        pass
+    return changed
 
 
 def sections_plain_text(section: Section) -> str:
