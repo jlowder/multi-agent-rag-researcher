@@ -235,6 +235,14 @@ Rules:
   missing aspects (empty list when sufficient). Each must be a concrete
   retrieval query, not a meta-instruction.
 - Return only the structured report; no prose.
+
+Output shape (fill in the values; use an empty list when nothing applies)
+— exactly one raw JSON object, no commentary before or after:
+{
+  "is_sufficient": false,
+  "missing_aspects": ["..."],
+  "follow_up_queries": ["..."]
+}
 """
 
 

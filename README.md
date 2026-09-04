@@ -272,7 +272,8 @@ The live env file is `utils/var.env` (gitignored). It is auto-seeded from `.env.
 
 - `LLM_MODEL` — default model for all agents. 
 - `DECOMPOSER_MODEL` — per-agent model override for deep mode's decomposer only. Its structured schema is produced more reliably by the larger model; every other agent stays on `LLM_MODEL`.
-- Per-agent `*_REASONING_EFFORT` (`low`/`medium`/`high`) and `*_MAX_OUTPUT_TOKENS` for all six agents (`retriever`, `writer`, `verifier`, `orchestrator`, `decomposer`, `sufficiency`). Defaults: writer and verifier run `medium` effort with 16,000 output tokens; retriever, orchestrator, and decomposer run `low` with 2,000; sufficiency runs `low` with 1,000.
+- Per-agent `*_REASONING_EFFORT` (`low`/`medium`/`high`) and `*_MAX_OUTPUT_TOKENS` for all six agents (`retriever`, `writer`, `verifier`, `orchestrator`, `decomposer`, `sufficiency`). Defaults: writer and verifier run `medium` effort with 16,000 output tokens; retriever, orchestrator, and decomposer run `low` with 2,000; sufficiency runs `low` with 2,000.
+- `LLM_ENABLE_THINKING` — forwarded to the LLM as `chat_template_kwargs.enable_thinking` (default **off**). The local MLX/omlx server ignores `reasoning.effort` and `/no_think`, and thinking models (Ornith/Qwen) spend their fixed ~16K-token generation budget on reasoning traces — which truncates the JSON output or starves the synthesis. Turn it on only if you want the model to reason out loud (8-10x slower).
 - The four original agents also accept full `*_ENDPOINT`/`*_API_KEY`/`*_MODEL` overrides (the decomposer accepts a model override only).
 - `TAVILY_API_KEY` powers web search; `EMBEDDING_ENDPOINT`/`EMBEDDING_MODEL`/`EMBEDDING_API_KEY` configure chunk embeddings.
 

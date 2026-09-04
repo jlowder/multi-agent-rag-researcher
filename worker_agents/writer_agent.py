@@ -1,6 +1,7 @@
 from .model_runner import run_model
 from typing import Any, Optional
 from utils.config import get_config
+from utils.json_extract import extract_json_payload_span
 import json
 import re
 from datetime import datetime, timezone
@@ -66,54 +67,21 @@ def _extract_json_object_span(text: str) -> tuple[dict | None, int]:
     """Extract a single JSON object from a model response (best-effort),
     returning (object, end-offset).
 
-    Strips ```json/``` code fences if the whole response is fenced, then
-    tries to raw_decode a JSON value at EVERY "{" index and collects the
-    dicts that parse. (The old first-"{"→last-"}" slice silently returned
-    None when prose around the JSON contained braces, or when two objects
-    appeared.) When any parsed dict contains a "blocks" or "heading" key
-    the LARGEST such dict (by decoded span) is returned — a prose decoy
-    like `example: {"heading": "wrong"}` may precede the real section —
-    otherwise the first parsed dict. Returns (None, -1) when nothing
+    Delegates to the shared utils.json_extract extractor (single source of
+    truth for preamble/fence-tolerant JSON recovery) with the writer's
+    preferred keys: among top-level objects, one carrying "blocks" or
+    "heading" wins (largest decoded span) — a prose decoy like
+    `example: {"heading": "wrong"}` may precede the real section —
+    otherwise the first top-level object wins, exactly as the original
+    object-only implementation did. Returns (None, -1) when no object
     parses (soft-fail). The end offset is the position in the stripped
     (de-fenced) text where the chosen object's decode ended, for
     post-object premature-close recovery.
     """
-    if not text:
+    value, end = extract_json_payload_span(text, prefer_keys=("blocks", "heading"))
+    if value is None or not isinstance(value, dict):
         return None, -1
-    candidate = text.strip()
-    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, re.DOTALL)
-    if fence:
-        candidate = fence.group(1).strip()
-    parsed: list[tuple[dict, int, int]] = []
-    spans: list[tuple[int, int]] = []
-    for i, ch in enumerate(candidate):
-        if ch != "{":
-            continue
-        try:
-            obj, end = _JSON_DECODER.raw_decode(candidate, i)
-        except ValueError:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        # Skip objects nested INSIDE an earlier-parsed object: when the
-        # response holds one top-level object, its inner dicts are parts of
-        # it, not competing objects (e.g. a report's section entries must
-        # not be preferred over the report itself).
-        if any(start <= i < e for start, e in spans):
-            continue
-        parsed.append((obj, i, end))
-        spans.append((i, end))
-    if not parsed:
-        return None, -1
-    # Prefer the LARGEST key-bearing dict (decoded span), not the first:
-    # a prose decoy like `example: {"heading": "wrong"}` may appear before
-    # the real section, and first-wins would let it steal the response.
-    keyed = [p for p in parsed if "blocks" in p[0] or "heading" in p[0]]
-    if keyed:
-        obj, _start, end = max(keyed, key=lambda p: p[2] - p[1])
-    else:
-        obj, _start, end = parsed[0]
-    return obj, end
+    return value, end
 
 
 def _extract_json_object(text: str) -> dict | None:
@@ -208,6 +176,25 @@ def _looks_truncated_json(text: str) -> bool:
     if fence:
         candidate = fence.group(1)
     return candidate.count("{") > candidate.count("}")
+
+
+def _has_no_json_content(text: Optional[str]) -> bool:
+    """True when the response carries no JSON at all — empty or pure prose.
+
+    The brace-imbalance heuristic (_looks_truncated_json) and the API's
+    truncation signal (_is_truncated_response) both miss this shape: the
+    local Responses shim never sets incomplete_details, and prose has no
+    braces to be imbalanced. A thinking-heavy model that spends its fixed
+    output budget on prose would otherwise yield a silent empty section, so
+    this also triggers the bounded 2x retry.
+    """
+    if text is None:
+        return True
+    candidate = text.strip()
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, re.DOTALL)
+    if fence:
+        candidate = fence.group(1)
+    return "{" not in candidate and "[" not in candidate
 
 
 # Bounded per-run budget for truncated-draft retries: a truncated
@@ -697,28 +684,35 @@ def write_section(
 
     if output_format == "json":
         obj, obj_end = _extract_json_object_span(text)
-        if (
-            obj is None
-            and (_is_truncated_response(response) or _looks_truncated_json(text))
-            and _take_writer_retry()
-        ):
-            if verbose:
-                print(
-                    f"[WRITER] WARNING: '{section_heading}' output looks truncated; "
-                    "retrying at 2x max_output_tokens"
+        if obj is None:
+            # An explicit API termination (incomplete_details, e.g.
+            # content_filter) wins over the pure-prose heuristic: filtered
+            # content is prose-shaped, but retrying it only re-filters.
+            api_details = getattr(response, "incomplete_details", None)
+            if _is_truncated_response(response) or _looks_truncated_json(text):
+                retry_reason = "looks truncated"
+            elif api_details is None and _has_no_json_content(text):
+                retry_reason = "contains no JSON object (empty or pure-prose output)"
+            else:
+                retry_reason = None
+            if retry_reason is not None and _take_writer_retry():
+                if verbose:
+                    print(
+                        f"[WRITER] WARNING: '{section_heading}' output {retry_reason}; "
+                        "retrying at 2x max_output_tokens"
+                    )
+                response = run_model(
+                    instructions=instructions,
+                    input_data=input_text,
+                    reasoning_effort=config.get_reasoning_effort("writer"),
+                    max_output_tokens=2 * config.get_max_output_tokens("writer"),
+                    tools=None,
+                    agent_name="writer",
+                    endpoint=endpoint,
+                    api_key=api_key,
                 )
-            response = run_model(
-                instructions=instructions,
-                input_data=input_text,
-                reasoning_effort=config.get_reasoning_effort("writer"),
-                max_output_tokens=2 * config.get_max_output_tokens("writer"),
-                tools=None,
-                agent_name="writer",
-                endpoint=endpoint,
-                api_key=api_key,
-            )
-            text = (response.output_text or "").strip()
-            obj, obj_end = _extract_json_object_span(text)
+                text = (response.output_text or "").strip()
+                obj, obj_end = _extract_json_object_span(text)
         if obj is not None:
             # Repair-before-validate: a single missing/None heading or id
             # must not kill an otherwise complete section.
@@ -759,8 +753,12 @@ def write_section(
                     recovered = _recover_trailing_blocks(text, obj_end, section.blocks)
                     if recovered:
                         if verbose:
+                            # INFO, not WARNING: live measurement showed the
+                            # model closes the object early but then emits
+                            # every intended block, so this recovery is
+                            # lossless — the section is complete as written.
                             print(
-                                f"[WRITER] WARNING: '{section_heading}' — "
+                                f"[WRITER] INFO: '{section_heading}' — "
                                 f"recovered {len(recovered)} block(s) written "
                                 "past the section object's premature close"
                             )
@@ -872,16 +870,23 @@ def write_synthesis(
 
     if output_format == "json":
         obj, obj_end = _extract_json_object_span(text)
-        if (
-            obj is None
-            and (_is_truncated_response(response) or _looks_truncated_json(text))
-            and _take_writer_retry()
-        ):
-            if verbose:
-                print(
-                    "[WRITER] WARNING: synthesis output looks truncated; "
-                    "retrying at 2x max_output_tokens"
-                )
+        if obj is None:
+            # An explicit API termination (incomplete_details, e.g.
+            # content_filter) wins over the pure-prose heuristic: filtered
+            # content is prose-shaped, but retrying it only re-filters.
+            api_details = getattr(response, "incomplete_details", None)
+            if _is_truncated_response(response) or _looks_truncated_json(text):
+                retry_reason = "looks truncated"
+            elif api_details is None and _has_no_json_content(text):
+                retry_reason = "contains no JSON object (empty or pure-prose output)"
+            else:
+                retry_reason = None
+            if retry_reason is not None and _take_writer_retry():
+                if verbose:
+                    print(
+                        f"[WRITER] WARNING: synthesis output {retry_reason}; "
+                        "retrying at 2x max_output_tokens"
+                    )
             response = run_model(
                 instructions=instructions,
                 input_data=input_text,
@@ -934,8 +939,11 @@ def write_synthesis(
                     recovered = _recover_trailing_blocks(text, obj_end, section.blocks)
                     if recovered:
                         if verbose:
+                            # INFO, not WARNING: the premature-close recovery
+                            # is measured lossless (the model emits every
+                            # intended block; none are dropped).
                             print(
-                                f"[WRITER] WARNING: 'Synthesis' — "
+                                f"[WRITER] INFO: 'Synthesis' — "
                                 f"recovered {len(recovered)} block(s) written "
                                 "past the section object's premature close"
                             )
