@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, timezone
 
@@ -22,6 +23,8 @@ from models import (
     find_unresolvable_citations,
 )
 from memory.helpers import registry_to_sources
+
+logger = logging.getLogger(__name__)
 
 EXEC_SUMMARY_JSON_INSTRUCTIONS = """
 Write the executive summary of the research report.
@@ -98,6 +101,68 @@ def _apply_empty_section_guards(report: ResearchReport) -> list:
         keep.append(section)
     report.report.sections = keep
     return not_generated
+
+
+def _block_has_renderable_content(block) -> bool:
+    """True if a block carries any non-empty text anywhere (its own text,
+    spans, list items, table cells, caption, or callout title)."""
+    if (block.text or "").strip():
+        return True
+    if any((s.text or "").strip() for s in block.spans or []):
+        return True
+    if any((i.text or "").strip() for i in block.items or []):
+        return True
+    if any((c.text or "").strip() for row in block.rows or [] for c in row or []):
+        return True
+    return bool((block.caption or "").strip() or (block.callout_title or "").strip())
+
+
+def _drop_orphan_subheadings(report: ResearchReport) -> list:
+    """Drop heading blocks whose content zone carries no renderable content,
+    in place. Returns "orphan_subheading: ..." gap entries; never raises.
+
+    Weak models occasionally emit a subsection heading and then write no
+    body (the PDF shows one heading stacked on the next). The section-level
+    word-count guard cannot see this: the surrounding section is full. So
+    work at block level. Level semantics: a heading of level L is "orphan"
+    when the blocks between it and the next heading of level <= L (or end of
+    the block list) contain ZERO blocks with renderable content. Headings
+    inside the zone do NOT count as content — so a level-2 heading whose
+    zone holds only deeper, also-unwritten subheadings is orphan and is
+    dropped along with them. A heading is kept as soon as ANY subsequent
+    block in its zone (at any depth below L) has content. Idempotent.
+    """
+    gaps: list = []
+    try:
+        for section in report.report.sections:
+            blocks = section.blocks or []
+            drop = set()
+            for i, block in enumerate(blocks):
+                if block.type != BlockType.heading:
+                    continue
+                level = int(block.level or 3)
+                j = len(blocks)
+                for k in range(i + 1, len(blocks)):
+                    if blocks[k].type == BlockType.heading and int(blocks[k].level or 3) <= level:
+                        j = k
+                        break
+                if not any(
+                    blocks[k].type != BlockType.heading
+                    and _block_has_renderable_content(blocks[k])
+                    for k in range(i + 1, j)
+                ):
+                    drop.add(i)
+                    text = (block.text or "").strip() or f"(level {level})"
+                    logger.warning(
+                        "dropping orphan subheading with no content zone: %s",
+                        text[:80],
+                    )
+                    gaps.append(f"orphan_subheading: {text[:120]}")
+            if drop:
+                section.blocks = [b for i, b in enumerate(blocks) if i not in drop]
+    except Exception:
+        pass
+    return gaps
 
 _JSON_DECODER = json.JSONDecoder()
 
@@ -430,7 +495,8 @@ def assemble_structured_report(
     Source records (plan §8.1), then renumber citation arrays and rewrite
     [D#]/[W#] text markers onto those final records (plan §6.3 — positions
     are 1-based into the deduped array, so they never go out of range),
-    promote undelimited display-equation spans to equation blocks, normalize
+    drop sub-heading blocks with no content zone, promote undelimited
+    display-equation spans to equation blocks, normalize
     comparison_table row widths to the header, and compute quality metrics.
     `evidence_json` is accepted for interface stability and reserved for
     future provenance fields.
@@ -460,6 +526,7 @@ def assemble_structured_report(
     dropped = drop_bare_numeric_citations(report, registry)
 
     not_generated = _apply_empty_section_guards(report)
+    orphan_gaps = _drop_orphan_subheadings(report)
 
     cited_keys = _collect_cited_keys(report, registry)
 
@@ -476,9 +543,10 @@ def assemble_structured_report(
         "unresolvable_citations": unresolvable,
         "dropped_bare_citations": dropped,
     }
-    if not_generated:
+    if not_generated or orphan_gaps:
         gaps = list(report.quality.verification.get("gaps") or [])
         gaps.extend(not_generated)
+        gaps.extend(orphan_gaps)
         report.quality.verification["gaps"] = gaps
 
     doc_count = sum(1 for s in report.report.sources if s.type == "report")
