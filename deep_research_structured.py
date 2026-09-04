@@ -496,7 +496,8 @@ def assemble_structured_report(
     [D#]/[W#] text markers onto those final records (plan §6.3 — positions
     are 1-based into the deduped array, so they never go out of range),
     drop sub-heading blocks with no content zone, promote undelimited
-    display-equation spans to equation blocks, normalize
+    display-equation spans to equation blocks, wrap undelimited inline LaTeX
+    runs in prose spans with $...$, normalize
     comparison_table row widths to the header, and compute quality metrics.
     `evidence_json` is accepted for interface stability and reserved for
     future provenance fields.
@@ -535,6 +536,7 @@ def assemble_structured_report(
 
     _remap_citations_to_final_sources(report, registry)
     _promote_bare_equation_spans(report)
+    _wrap_undelimited_latex(report)
     _normalize_comparison_table_widths(report)
 
     report.quality.citation_density = compute_citation_density(report)
@@ -615,6 +617,269 @@ def _normalize_comparison_table_widths(report: ResearchReport) -> int:
                     if cells != row:
                         block.rows[i] = cells
                         changed += 1
+    except Exception:
+        pass
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# Undelimited-LaTeX sanitizer (model-agnostic math hygiene)
+#
+# Some models ignore the $...$ inline-math rule and emit raw LaTeX runs
+# embedded in prose (|\psi\rangle, 2^{N}-dimensional, S_A = S_B). KaTeX can
+# only typeset delimited math, so those runs print as literal backslash soup.
+# This pass wraps each undelimited math RUN with $...$. It is deliberately
+# conservative — a run starts ONLY on strong signals and extends only over
+# math-shaped characters — so prose can never be captured into math.
+# ---------------------------------------------------------------------------
+
+_LATEX_PROTECTED_RE = re.compile(
+    r"\$\$[\s\S]+?\$\$|\$[^$\n]+?\$|\\\[[\s\S]+?\\\]|\\\(.*?\\\)"
+)
+
+# Space variants models emit (regular, nbsp, thin/hair/narrow nbsp).
+_LATEX_SPACES = " \u00a0\u2007\u2009\u202f"
+
+
+def _snip(text: str, width: int = 60) -> str:
+    """Head+tail snippet for log lines (993abfa pattern)."""
+    text = (text or "").replace("\n", "\\n")
+    if len(text) <= width * 2:
+        return text
+    return f"{text[:width]}…{text[-width:]}"
+
+
+def _is_backslash_seq(text: str, i: int) -> int:
+    """If text[i:] starts a backslash sequence, return its length; else 0."""
+    if i >= len(text) or text[i] != "\\":
+        return 0
+    j = i + 1
+    if j < len(text) and text[j].isalpha():
+        while j < len(text) and text[j].isalpha():
+            j += 1
+        return j - i
+    if j < len(text):
+        return 2  # \, \; \\ etc.
+    return 1
+
+
+def _letter_run(text: str, i: int) -> int:
+    """Length of the letter run starting at i (case-insensitive)."""
+    j = i
+    while j < len(text) and text[j].isalpha():
+        j += 1
+    return j - i
+
+
+def _math_run_start(text: str, i: int, protected) -> int:
+    """Return the true start of a math run at/just before index i, or -1.
+
+    Strong start signals (and only these):
+      S1: a backslash command (\\lambda, \\psi, ...)
+      S2: a braced super/subscript (^{ ... _{) — absorbing ONE preceding
+          alphanumeric base char (2^{N} -> base 2)
+      S3: a lone | (ket/bra opener) when directly followed by a backslash
+          command or letter — absorbed into the run
+      S4: base ^/_ arg where the arg is uppercase/digit/braced (S_A, x^2)
+          — a lowercase arg (3^rd party) is treated as prose and rejected
+    """
+    n = len(text)
+    c = text[i]
+    # S1: backslash command
+    if c == "\\" and i + 1 < n and text[i + 1].isalpha():
+        s = i
+        if s > 0 and text[s - 1] == "{" and not protected[s - 1]:
+            s -= 1  # absorb an opening group brace: {\lambda_i}
+        return s
+    # S2: braced super/subscript with a base
+    if c in "^_" and i + 1 < n and text[i + 1] == "{":
+        if i > 0 and text[i - 1].isalnum() and not protected[i - 1]:
+            return i - 1
+        return i
+    # S3: ket/bra opener
+    if c == "|" and i + 1 < n and (
+        text[i + 1] == "\\" or text[i + 1].isalpha()
+    ):
+        return i
+    # S4: base ^/_ arg with a non-lowercase arg
+    if i > 0 and text[i - 1].isalnum() and c in "^_" and i + 1 < n:
+        a = text[i + 1]
+        if a == "{" or a == "\\" or a.isupper() or a.isdigit():
+            return i - 1
+    return -1
+
+
+def _math_run_extent(text: str, start: int, protected) -> int:
+    """Extend a math run rightward; return the end index (exclusive).
+
+    Continues over math-shaped characters (backslash sequences, braces,
+    ^ _, digits, letters, math operators, kets, parens) and across a single
+    space when the next token looks mathematical. Stops at a run of >=2
+    consecutive lowercase letters (prose words), >=3 uppercase, or a
+    non-math character. A single lowercase letter continues (p_n, e^{i...}).
+    """
+    j = start
+    n = len(text)
+    while j < n and not protected[j]:
+        c = text[j]
+        if c == "\\":
+            ln = _is_backslash_seq(text, j)
+            if ln:
+                j += ln
+                continue
+            break
+        if c.isalpha():
+            lr = _letter_run(text, j)
+            if lr and c.islower() and lr >= 2:
+                break  # prose word
+            if lr and c.isupper() and lr >= 3:
+                break  # prose acronym
+            j += lr
+            continue
+        if c in "{}^_0123456789=+-*/.~:;,()|":
+            j += 1
+            continue
+        if c in _LATEX_SPACES:
+            k = j
+            while k < n and text[k] in _LATEX_SPACES:
+                k += 1
+            if k - j == 1 and k < n and not protected[k]:
+                nk = text[k]
+                base_signal = nk.isalpha() and k + 1 < n and text[k + 1] in "^_{"
+                if (
+                    _math_run_start(text, k, protected) >= 0
+                    or base_signal
+                    or nk.isdigit()
+                ):
+                    j = k  # rescan from the signaled char (keeps backslash/base)
+                    continue
+            break
+        break
+    return j
+
+
+def _trim_math_run(run: str) -> tuple:
+    """Drop dangling operators/punctuation/whitespace from the run edges.
+
+    Returns (core, head, tail) where head/tail are the trimmed-overhang
+    characters, re-emitted outside the $...$ so nothing is lost (a hyphen in
+    ``2^{N}-dimensional`` stays in the prose; a sentence-final ``.`` stays a
+    period). Never lets the core become empty of a real math token.
+    """
+    danglers = set("+-=*/.~:;,() ") | set(_LATEX_SPACES)
+    head = ""
+    tail = ""
+    while run and run[-1] in danglers and _run_has_core(run[:-1]):
+        tail = run[-1] + tail
+        run = run[:-1]
+    # a trailing unbalanced closing brace (kept its opener outside the run)
+    while run and run[-1] == "}" and run.count("{") < run.count("}"):
+        tail = run[-1] + tail
+        run = run[:-1]
+    while run and run[0] in "()+ " and _run_has_core(run[1:]):
+        head = run[0] + head
+        run = run[1:]
+    return run, head, tail
+
+
+def _run_has_core(run: str) -> bool:
+    return bool(re.search(r"\\[a-zA-Z]|[A-Za-z0-9]", run))
+
+
+def _wrap_latex_in_text(text: str) -> tuple:
+    r"""Wrap every undelimited math run in $...$; return (new_text, n_runs).
+
+    Text already inside $...$/$$..$$/\(..\)/\[..\] is protected and never
+    touched, which also makes the pass idempotent. Never raises.
+    """
+    if not text:
+        return text, 0
+    try:
+        protected = [False] * len(text)
+        for m in _LATEX_PROTECTED_RE.finditer(text):
+            for k in range(m.start(), m.end()):
+                protected[k] = True
+        out = []
+        i = 0
+        n = len(text)
+        wrapped = 0
+        while i < n:
+            if protected[i]:
+                j = i
+                while j < n and protected[j]:
+                    j += 1
+                out.append(text[i:j])
+                i = j
+                continue
+            s = _math_run_start(text, i, protected)
+            if s < 0:
+                out.append(text[i])
+                i += 1
+                continue
+            e = _math_run_extent(text, max(s, i), protected)
+            run, head, tail = _trim_math_run(text[s:e])
+            if not run or not _run_has_core(run):
+                out.append(text[i])
+                i += 1
+                continue
+            if s < i:
+                # absorbed base/brace/ket char was already appended
+                out.pop()
+            out.append(head + "$" + run + "$" + tail)
+            wrapped += 1
+            i = max(e, i + 1)
+        return ("".join(out), wrapped) if wrapped else (text, 0)
+    except Exception:
+        return text, 0
+
+
+def _wrap_undelimited_latex(report: ResearchReport) -> int:
+    """Wrap undelimited LaTeX runs in every span/item/cell/block text and in
+    the executive summary, in place. Logs a WARNING (before/after snippets)
+    for each modified text. Returns the number of modified texts; never
+    raises. Model-agnostic: catches whatever math a model leaks into prose.
+    """
+    changed = 0
+    try:
+        for idx, para in enumerate(report.report.executive_summary or []):
+            if isinstance(para, str):
+                new, k = _wrap_latex_in_text(para)
+                if k:
+                    logger.warning(
+                        "wrapped %d undelimited LaTeX run(s) in exec summary (before: %s | after: %s)",
+                        k,
+                        _snip(para, 50),
+                        _snip(new, 50),
+                    )
+                    report.report.executive_summary[idx] = new
+                    changed += 1
+        for section in report.report.sections:
+            for block in section.blocks or []:
+                for target in [
+                    *(block.spans or []),
+                    *(block.items or []),
+                    *(c for row in (block.rows or []) for c in (row or [])),
+                ]:
+                    new, k = _wrap_latex_in_text(target.text or "")
+                    if k:
+                        logger.warning(
+                            "wrapped %d undelimited LaTeX run(s) in span (before: %s | after: %s)",
+                            k,
+                            _snip(target.text, 50),
+                            _snip(new, 50),
+                        )
+                        target.text = new
+                        changed += 1
+                new, k = _wrap_latex_in_text(block.text or "")
+                if k:
+                    logger.warning(
+                        "wrapped %d undelimited LaTeX run(s) in block text (before: %s | after: %s)",
+                        k,
+                        _snip(block.text, 50),
+                        _snip(new, 50),
+                    )
+                    block.text = new
+                    changed += 1
     except Exception:
         pass
     return changed
