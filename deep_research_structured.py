@@ -640,6 +640,14 @@ _LATEX_PROTECTED_RE = re.compile(
 # Space variants models emit (regular, nbsp, thin/hair/narrow nbsp).
 _LATEX_SPACES = " \u00a0\u2007\u2009\u202f"
 
+# Ket/bra delimiters (note the different lengths: \langle = 8, \rangle = 7).
+_LANGLE = "\\langle"
+_RANGLE = "\\rangle"
+
+# Max distance (chars) between a ket/bra opener and its closing delimiter.
+# Bounds the search so a lone prose `|` can never swallow the rest of a span.
+_KET_UNIT_WINDOW = 64
+
 
 def _snip(text: str, width: int = 60) -> str:
     """Head+tail snippet for log lines (993abfa pattern)."""
@@ -671,6 +679,37 @@ def _letter_run(text: str, i: int) -> int:
     return j - i
 
 
+def _find_unit_close(text: str, open_idx: int, close_is_pipe: bool) -> int:
+    """Index of the closing delimiter of the ket/bra unit opened at open_idx,
+    within _KET_UNIT_WINDOW, or -1.
+
+    The opener is text[open_idx] (``|`` for a ket, ``<`` for a bra). The
+    interior must be math-ish: a space followed by a lowercase letter run
+    (prose words) disqualifies the unit, as does a missing closer.
+    """
+    n = len(text)
+    i = open_idx + 1
+    limit = min(n, open_idx + _KET_UNIT_WINDOW + 1)
+    while i < limit:
+        c = text[i]
+        if (
+            c == "\\"
+            and text.startswith(_RANGLE, i)
+            and (i + len(_RANGLE) >= n or text[i + len(_RANGLE)] != "a")
+        ):
+            return i
+        if close_is_pipe and c == "|":
+            return i
+        if c in _LATEX_SPACES:
+            k = i
+            while k < n and text[k] in _LATEX_SPACES:
+                k += 1
+            if k + 2 <= n and text[k].islower() and text[k + 1].islower():
+                return -1  # prose word inside => not a ket/bra unit
+        i += 1
+    return -1
+
+
 def _math_run_start(text: str, i: int, protected) -> int:
     """Return the true start of a math run at/just before index i, or -1.
 
@@ -678,8 +717,10 @@ def _math_run_start(text: str, i: int, protected) -> int:
       S1: a backslash command (\\lambda, \\psi, ...)
       S2: a braced super/subscript (^{ ... _{) — absorbing ONE preceding
           alphanumeric base char (2^{N} -> base 2)
-      S3: a lone | (ket/bra opener) when directly followed by a backslash
-          command or letter — absorbed into the run
+      S3: a ket/bra unit: ``|`` opening a ``|…\\rangle`` ket, or ``\\langle``
+          opening a ``\\langle…|`` bra. The opener is accepted only when its
+          closing delimiter sits within _KET_UNIT_WINDOW with a math-ish
+          interior, so a literal prose pipe (``A | B``) never starts a run.
       S4: base ^/_ arg where the arg is uppercase/digit/braced (S_A, x^2)
           — a lowercase arg (3^rd party) is treated as prose and rejected
     """
@@ -696,11 +737,21 @@ def _math_run_start(text: str, i: int, protected) -> int:
         if i > 0 and text[i - 1].isalnum() and not protected[i - 1]:
             return i - 1
         return i
-    # S3: ket/bra opener
+    # S3: ket/bra unit opener (| with a \rangle partner, or \langle with a |
+    # partner within the window) — the WHOLE unit becomes one run so the
+    # ``|00`` opener is typeset in math, not body font.
     if c == "|" and i + 1 < n and (
-        text[i + 1] == "\\" or text[i + 1].isalpha()
+        text[i + 1] == "\\" or text[i + 1].isalnum()
     ):
-        return i
+        if _find_unit_close(text, i, False) >= 0:
+            return i
+    if c == "|" and i + 1 < n and text[i + 1] in _LATEX_SPACES:
+        k = i + 1
+        while k < n and text[k] in _LATEX_SPACES:
+            k += 1
+        if k < n and (text[k] == "\\" or text[k].isalnum()):
+            if _find_unit_close(text, i, False) >= 0:
+                return i
     # S4: base ^/_ arg with a non-lowercase arg
     if i > 0 and text[i - 1].isalnum() and c in "^_" and i + 1 < n:
         a = text[i + 1]
@@ -720,14 +771,53 @@ def _math_run_extent(text: str, start: int, protected) -> int:
     """
     j = start
     n = len(text)
+    # Unit mode: the run began with a ket/bra opener — it then extends only
+    # until the unit's closing delimiter (\rangle for kets, | for bras).
+    mode = None
+    if start < n and text[start] == "|":
+        mode = "ket"
+    elif text.startswith(_LANGLE, start) and (
+        start + len(_LANGLE) >= n or text[start + len(_LANGLE)] != "a"
+    ):
+        mode = "bra"
+    unit_closed = False
+    close_at = -1  # position just past a ket/bra closing delimiter
     while j < n and not protected[j]:
+        if mode is not None and not unit_closed and (j - start) > _KET_UNIT_WINDOW:
+            return start  # closer never found: collapse (opener stays prose)
         c = text[j]
         if c == "\\":
+            if (
+                mode == "ket"
+                and text.startswith(_RANGLE, j)
+                and (j + len(_RANGLE) >= n or text[j + len(_RANGLE)] != "a")
+            ):
+                j += len(_RANGLE)
+                unit_closed = True
+                # Close of a ket: unless the expression continues DIRECTLY
+                # through it (|u_i\rangle\otimes|v_i\rangle stays one run),
+                # the unit ended and the run stops — so |00\rangle keeps its
+                # opener, and |+.../-dimensional keep their prose tails.
+                close_at = j
+                if j >= n or text[j] in _LATEX_SPACES or text[j] in ".,;:!()]":
+                    break
+                if text[j].islower() and j + 1 < n and text[j + 1].islower():
+                    break  # a prose word follows
+                continue
             ln = _is_backslash_seq(text, j)
             if ln:
                 j += ln
                 continue
             break
+        if mode == "bra" and c == "|":
+            j += 1
+            unit_closed = True
+            close_at = j
+            if j >= n or text[j] in ".,;:!()]:" or text[j] in _LATEX_SPACES:
+                break
+            if text[j].islower() and j + 1 < n and text[j + 1].islower():
+                break  # a prose word follows the closing |
+            continue
         if c.isalpha():
             lr = _letter_run(text, j)
             if lr and c.islower() and lr >= 2:
@@ -740,6 +830,10 @@ def _math_run_extent(text: str, start: int, protected) -> int:
             j += 1
             continue
         if c in _LATEX_SPACES:
+            # a space directly after the unit's close ends the run (a ket
+            # cannot span a space into a new token, e.g. |00\rangle + ...)
+            if mode is not None and unit_closed and close_at == j:
+                break
             k = j
             while k < n and text[k] in _LATEX_SPACES:
                 k += 1
@@ -750,7 +844,7 @@ def _math_run_extent(text: str, start: int, protected) -> int:
                     _math_run_start(text, k, protected) >= 0
                     or base_signal
                     or nk.isdigit()
-                ):
+                ) and not (mode is not None and unit_closed):
                     j = k  # rescan from the signaled char (keeps backslash/base)
                     continue
             break

@@ -65,11 +65,12 @@ def test_ket_sum_run_wrapped_as_one_run():
         + "{\\lambda_i} are coefficients"
     )
     new, k = _wrap_latex_in_text(t)
-    assert k == 2
-    assert (
-        "$|\\psi\\rangle=\\sum_{i=1}^{k} \\lambda_i |u_i\\rangle\\otimes|v_i\\rangle$"
-        in new
-    )
+    # unit semantics: the pre-ket part of the sum, the lambda+ket/tensor
+    # unit, and the lone {λ_i} are three runs — all fully wrapped, prose
+    # intact, and every |…\rangle unit keeps its opener inside the math
+    assert k == 3
+    assert "$|\\psi\\rangle=\\sum_{i=1}^{k}$" in new
+    assert "$\\lambda_i |u_i\\rangle\\otimes|v_i\\rangle$" in new
     assert new.endswith("${\\lambda_i}$ are coefficients")
     # no prose captured: the words around the runs are intact
     assert new.startswith("a canonical form $")
@@ -195,3 +196,74 @@ def test_report_level_wraps_spans_cells_and_exec_summary():
 def test_report_level_is_noop_when_no_math():
     rep = _report(_para("pure prose with no math at all"))
     assert _wrap_undelimited_latex(rep) == 0
+
+# ---------------------------------------------------------------------------
+# ket/bra units: |…\rangle and \langle…| must become single math runs
+# ---------------------------------------------------------------------------
+
+
+def test_ket_units_fully_wrapped():
+    """Bell span: every |…\\rangle is one run INCLUDING the | opener."""
+    text = (
+        "The maximally entangled Bell state |\\Phi^+\\rangle = "
+        "(|00\\rangle + |11\\rangle)/\\sqrt{2} and each term has equal weight."
+    )
+    new, _ = _wrap_latex_in_text(text)
+    assert "$|\\Phi^+\\rangle$" in new
+    assert "$|00\\rangle$" in new
+    assert "$|11\\rangle$" in new
+    assert "$\\sqrt{2}$" in new
+    assert " and each term has equal weight." in new
+    new2, _ = _wrap_latex_in_text(new)
+    assert new2 == new
+
+
+def test_prose_pipe_without_partner_untouched():
+    text = "Filter A | B gives C when the input matches A | B or none at all."
+    new, n = _wrap_latex_in_text(text)
+    assert new == text
+    assert n == 0
+
+
+def test_bra_unit_fully_wrapped():
+    text = (
+        "For any state |\\psi\\rangle the dual |\\psi\\rangle is "
+        "\\langle\\psi| and that is all."
+    )
+    new, _ = _wrap_latex_in_text(text)
+    assert "$|\\psi\\rangle$" in new
+    assert "$\\langle\\psi|$" in new
+    assert " and that is all." in new
+
+
+def test_sandwich_bra_ket_runs_valid():
+    text = "the inner product \\langle\\psi|\\hat{U}|\\phi\\rangle is unitary here"
+    new, _ = _wrap_latex_in_text(text)
+    # the closing | is followed by a math token, so the whole sandwich is one run
+    assert "$\\langle\\psi|\\hat{U}|\\phi\\rangle$" in new
+    assert " is unitary here" in new
+    new2, _ = _wrap_latex_in_text(new)
+    assert new2 == new
+
+
+def test_ket_with_interior_space():
+    text = "the state | 00\\rangle plus | 11\\rangle here"
+    new, _ = _wrap_latex_in_text(text)
+    assert "$| 00\\rangle$" in new
+    assert "$| 11\\rangle$" in new
+
+
+def test_pipe_far_from_partner_not_captured():
+    text = "Column A | B | C" + " " * 70 + "ends with \\rangle somewhere"
+    new, _ = _wrap_latex_in_text(text)
+    assert "A | B | C" in new
+    assert "$A" not in new
+
+
+def test_ket_idempotent_and_mixed_prose():
+    text = "Prepare |\\phi\\rangle, apply U, then measure in the computational basis."
+    a, _ = _wrap_latex_in_text(text)
+    b, _ = _wrap_latex_in_text(a)
+    assert a == b
+    assert "$|\\phi\\rangle$" in a
+    assert " apply U, then measure in the computational basis." in a
