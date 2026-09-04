@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, timezone
 
@@ -22,6 +23,8 @@ from models import (
     find_unresolvable_citations,
 )
 from memory.helpers import registry_to_sources
+
+logger = logging.getLogger(__name__)
 
 EXEC_SUMMARY_JSON_INSTRUCTIONS = """
 Write the executive summary of the research report.
@@ -98,6 +101,68 @@ def _apply_empty_section_guards(report: ResearchReport) -> list:
         keep.append(section)
     report.report.sections = keep
     return not_generated
+
+
+def _block_has_renderable_content(block) -> bool:
+    """True if a block carries any non-empty text anywhere (its own text,
+    spans, list items, table cells, caption, or callout title)."""
+    if (block.text or "").strip():
+        return True
+    if any((s.text or "").strip() for s in block.spans or []):
+        return True
+    if any((i.text or "").strip() for i in block.items or []):
+        return True
+    if any((c.text or "").strip() for row in block.rows or [] for c in row or []):
+        return True
+    return bool((block.caption or "").strip() or (block.callout_title or "").strip())
+
+
+def _drop_orphan_subheadings(report: ResearchReport) -> list:
+    """Drop heading blocks whose content zone carries no renderable content,
+    in place. Returns "orphan_subheading: ..." gap entries; never raises.
+
+    Weak models occasionally emit a subsection heading and then write no
+    body (the PDF shows one heading stacked on the next). The section-level
+    word-count guard cannot see this: the surrounding section is full. So
+    work at block level. Level semantics: a heading of level L is "orphan"
+    when the blocks between it and the next heading of level <= L (or end of
+    the block list) contain ZERO blocks with renderable content. Headings
+    inside the zone do NOT count as content — so a level-2 heading whose
+    zone holds only deeper, also-unwritten subheadings is orphan and is
+    dropped along with them. A heading is kept as soon as ANY subsequent
+    block in its zone (at any depth below L) has content. Idempotent.
+    """
+    gaps: list = []
+    try:
+        for section in report.report.sections:
+            blocks = section.blocks or []
+            drop = set()
+            for i, block in enumerate(blocks):
+                if block.type != BlockType.heading:
+                    continue
+                level = int(block.level or 3)
+                j = len(blocks)
+                for k in range(i + 1, len(blocks)):
+                    if blocks[k].type == BlockType.heading and int(blocks[k].level or 3) <= level:
+                        j = k
+                        break
+                if not any(
+                    blocks[k].type != BlockType.heading
+                    and _block_has_renderable_content(blocks[k])
+                    for k in range(i + 1, j)
+                ):
+                    drop.add(i)
+                    text = (block.text or "").strip() or f"(level {level})"
+                    logger.warning(
+                        "dropping orphan subheading with no content zone: %s",
+                        text[:80],
+                    )
+                    gaps.append(f"orphan_subheading: {text[:120]}")
+            if drop:
+                section.blocks = [b for i, b in enumerate(blocks) if i not in drop]
+    except Exception:
+        pass
+    return gaps
 
 _JSON_DECODER = json.JSONDecoder()
 
@@ -430,7 +495,9 @@ def assemble_structured_report(
     Source records (plan §8.1), then renumber citation arrays and rewrite
     [D#]/[W#] text markers onto those final records (plan §6.3 — positions
     are 1-based into the deduped array, so they never go out of range),
-    promote undelimited display-equation spans to equation blocks, normalize
+    drop sub-heading blocks with no content zone, promote undelimited
+    display-equation spans to equation blocks, wrap undelimited inline LaTeX
+    runs in prose spans with $...$, normalize
     comparison_table row widths to the header, and compute quality metrics.
     `evidence_json` is accepted for interface stability and reserved for
     future provenance fields.
@@ -460,6 +527,7 @@ def assemble_structured_report(
     dropped = drop_bare_numeric_citations(report, registry)
 
     not_generated = _apply_empty_section_guards(report)
+    orphan_gaps = _drop_orphan_subheadings(report)
 
     cited_keys = _collect_cited_keys(report, registry)
 
@@ -468,6 +536,7 @@ def assemble_structured_report(
 
     _remap_citations_to_final_sources(report, registry)
     _promote_bare_equation_spans(report)
+    _wrap_undelimited_latex(report)
     _normalize_comparison_table_widths(report)
 
     report.quality.citation_density = compute_citation_density(report)
@@ -476,9 +545,10 @@ def assemble_structured_report(
         "unresolvable_citations": unresolvable,
         "dropped_bare_citations": dropped,
     }
-    if not_generated:
+    if not_generated or orphan_gaps:
         gaps = list(report.quality.verification.get("gaps") or [])
         gaps.extend(not_generated)
+        gaps.extend(orphan_gaps)
         report.quality.verification["gaps"] = gaps
 
     doc_count = sum(1 for s in report.report.sources if s.type == "report")
@@ -547,6 +617,363 @@ def _normalize_comparison_table_widths(report: ResearchReport) -> int:
                     if cells != row:
                         block.rows[i] = cells
                         changed += 1
+    except Exception:
+        pass
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# Undelimited-LaTeX sanitizer (model-agnostic math hygiene)
+#
+# Some models ignore the $...$ inline-math rule and emit raw LaTeX runs
+# embedded in prose (|\psi\rangle, 2^{N}-dimensional, S_A = S_B). KaTeX can
+# only typeset delimited math, so those runs print as literal backslash soup.
+# This pass wraps each undelimited math RUN with $...$. It is deliberately
+# conservative — a run starts ONLY on strong signals and extends only over
+# math-shaped characters — so prose can never be captured into math.
+# ---------------------------------------------------------------------------
+
+_LATEX_PROTECTED_RE = re.compile(
+    r"\$\$[\s\S]+?\$\$|\$[^$\n]+?\$|\\\[[\s\S]+?\\\]|\\\(.*?\\\)"
+)
+
+# Space variants models emit (regular, nbsp, thin/hair/narrow nbsp).
+_LATEX_SPACES = " \u00a0\u2007\u2009\u202f"
+
+# Ket/bra delimiters (note the different lengths: \langle = 8, \rangle = 7).
+_LANGLE = "\\langle"
+_RANGLE = "\\rangle"
+
+# Max distance (chars) between a ket/bra opener and its closing delimiter.
+# Bounds the search so a lone prose `|` can never swallow the rest of a span.
+_KET_UNIT_WINDOW = 64
+
+
+def _snip(text: str, width: int = 60) -> str:
+    """Head+tail snippet for log lines (993abfa pattern)."""
+    text = (text or "").replace("\n", "\\n")
+    if len(text) <= width * 2:
+        return text
+    return f"{text[:width]}…{text[-width:]}"
+
+
+def _is_backslash_seq(text: str, i: int) -> int:
+    """If text[i:] starts a backslash sequence, return its length; else 0."""
+    if i >= len(text) or text[i] != "\\":
+        return 0
+    j = i + 1
+    if j < len(text) and text[j].isalpha():
+        while j < len(text) and text[j].isalpha():
+            j += 1
+        return j - i
+    if j < len(text):
+        return 2  # \, \; \\ etc.
+    return 1
+
+
+def _letter_run(text: str, i: int) -> int:
+    """Length of the letter run starting at i (case-insensitive)."""
+    j = i
+    while j < len(text) and text[j].isalpha():
+        j += 1
+    return j - i
+
+
+def _find_unit_close(text: str, open_idx: int, close_is_pipe: bool) -> int:
+    """Index of the closing delimiter of the ket/bra unit opened at open_idx,
+    within _KET_UNIT_WINDOW, or -1.
+
+    The opener is text[open_idx] (``|`` for a ket, ``<`` for a bra). The
+    interior must be math-ish: a space followed by a lowercase letter run
+    (prose words) disqualifies the unit, as does a missing closer.
+    """
+    n = len(text)
+    i = open_idx + 1
+    limit = min(n, open_idx + _KET_UNIT_WINDOW + 1)
+    while i < limit:
+        c = text[i]
+        if (
+            c == "\\"
+            and text.startswith(_RANGLE, i)
+            and (i + len(_RANGLE) >= n or text[i + len(_RANGLE)] != "a")
+        ):
+            return i
+        if close_is_pipe and c == "|":
+            return i
+        if c in _LATEX_SPACES:
+            k = i
+            while k < n and text[k] in _LATEX_SPACES:
+                k += 1
+            if k + 2 <= n and text[k].islower() and text[k + 1].islower():
+                return -1  # prose word inside => not a ket/bra unit
+        i += 1
+    return -1
+
+
+def _math_run_start(text: str, i: int, protected) -> int:
+    """Return the true start of a math run at/just before index i, or -1.
+
+    Strong start signals (and only these):
+      S1: a backslash command (\\lambda, \\psi, ...)
+      S2: a braced super/subscript (^{ ... _{) — absorbing ONE preceding
+          alphanumeric base char (2^{N} -> base 2)
+      S3: a ket/bra unit: ``|`` opening a ``|…\\rangle`` ket, or ``\\langle``
+          opening a ``\\langle…|`` bra. The opener is accepted only when its
+          closing delimiter sits within _KET_UNIT_WINDOW with a math-ish
+          interior, so a literal prose pipe (``A | B``) never starts a run.
+      S4: base ^/_ arg where the arg is uppercase/digit/braced (S_A, x^2)
+          — a lowercase arg (3^rd party) is treated as prose and rejected
+    """
+    n = len(text)
+    c = text[i]
+    # S1: backslash command
+    if c == "\\" and i + 1 < n and text[i + 1].isalpha():
+        s = i
+        if s > 0 and text[s - 1] == "{" and not protected[s - 1]:
+            s -= 1  # absorb an opening group brace: {\lambda_i}
+        return s
+    # S2: braced super/subscript with a base
+    if c in "^_" and i + 1 < n and text[i + 1] == "{":
+        if i > 0 and text[i - 1].isalnum() and not protected[i - 1]:
+            return i - 1
+        return i
+    # S3: ket/bra unit opener (| with a \rangle partner, or \langle with a |
+    # partner within the window) — the WHOLE unit becomes one run so the
+    # ``|00`` opener is typeset in math, not body font.
+    if c == "|" and i + 1 < n and (
+        text[i + 1] == "\\" or text[i + 1].isalnum()
+    ):
+        if _find_unit_close(text, i, False) >= 0:
+            return i
+    if c == "|" and i + 1 < n and text[i + 1] in _LATEX_SPACES:
+        k = i + 1
+        while k < n and text[k] in _LATEX_SPACES:
+            k += 1
+        if k < n and (text[k] == "\\" or text[k].isalnum()):
+            if _find_unit_close(text, i, False) >= 0:
+                return i
+    # S4: base ^/_ arg with a non-lowercase arg
+    if i > 0 and text[i - 1].isalnum() and c in "^_" and i + 1 < n:
+        a = text[i + 1]
+        if a == "{" or a == "\\" or a.isupper() or a.isdigit():
+            return i - 1
+    return -1
+
+
+def _math_run_extent(text: str, start: int, protected) -> int:
+    """Extend a math run rightward; return the end index (exclusive).
+
+    Continues over math-shaped characters (backslash sequences, braces,
+    ^ _, digits, letters, math operators, kets, parens) and across a single
+    space when the next token looks mathematical. Stops at a run of >=2
+    consecutive lowercase letters (prose words), >=3 uppercase, or a
+    non-math character. A single lowercase letter continues (p_n, e^{i...}).
+    """
+    j = start
+    n = len(text)
+    # Unit mode: the run began with a ket/bra opener — it then extends only
+    # until the unit's closing delimiter (\rangle for kets, | for bras).
+    mode = None
+    if start < n and text[start] == "|":
+        mode = "ket"
+    elif text.startswith(_LANGLE, start) and (
+        start + len(_LANGLE) >= n or text[start + len(_LANGLE)] != "a"
+    ):
+        mode = "bra"
+    unit_closed = False
+    close_at = -1  # position just past a ket/bra closing delimiter
+    while j < n and not protected[j]:
+        if mode is not None and not unit_closed and (j - start) > _KET_UNIT_WINDOW:
+            return start  # closer never found: collapse (opener stays prose)
+        c = text[j]
+        if c == "\\":
+            if (
+                mode == "ket"
+                and text.startswith(_RANGLE, j)
+                and (j + len(_RANGLE) >= n or text[j + len(_RANGLE)] != "a")
+            ):
+                j += len(_RANGLE)
+                unit_closed = True
+                # Close of a ket: unless the expression continues DIRECTLY
+                # through it (|u_i\rangle\otimes|v_i\rangle stays one run),
+                # the unit ended and the run stops — so |00\rangle keeps its
+                # opener, and |+.../-dimensional keep their prose tails.
+                close_at = j
+                if j >= n or text[j] in _LATEX_SPACES or text[j] in ".,;:!()]":
+                    break
+                if text[j].islower() and j + 1 < n and text[j + 1].islower():
+                    break  # a prose word follows
+                continue
+            ln = _is_backslash_seq(text, j)
+            if ln:
+                j += ln
+                continue
+            break
+        if mode == "bra" and c == "|":
+            j += 1
+            unit_closed = True
+            close_at = j
+            if j >= n or text[j] in ".,;:!()]:" or text[j] in _LATEX_SPACES:
+                break
+            if text[j].islower() and j + 1 < n and text[j + 1].islower():
+                break  # a prose word follows the closing |
+            continue
+        if c.isalpha():
+            lr = _letter_run(text, j)
+            if lr and c.islower() and lr >= 2:
+                break  # prose word
+            if lr and c.isupper() and lr >= 3:
+                break  # prose acronym
+            j += lr
+            continue
+        if c in "{}^_0123456789=+-*/.~:;,()|":
+            j += 1
+            continue
+        if c in _LATEX_SPACES:
+            # a space directly after the unit's close ends the run (a ket
+            # cannot span a space into a new token, e.g. |00\rangle + ...)
+            if mode is not None and unit_closed and close_at == j:
+                break
+            k = j
+            while k < n and text[k] in _LATEX_SPACES:
+                k += 1
+            if k - j == 1 and k < n and not protected[k]:
+                nk = text[k]
+                base_signal = nk.isalpha() and k + 1 < n and text[k + 1] in "^_{"
+                if (
+                    _math_run_start(text, k, protected) >= 0
+                    or base_signal
+                    or nk.isdigit()
+                ) and not (mode is not None and unit_closed):
+                    j = k  # rescan from the signaled char (keeps backslash/base)
+                    continue
+            break
+        break
+    return j
+
+
+def _trim_math_run(run: str) -> tuple:
+    """Drop dangling operators/punctuation/whitespace from the run edges.
+
+    Returns (core, head, tail) where head/tail are the trimmed-overhang
+    characters, re-emitted outside the $...$ so nothing is lost (a hyphen in
+    ``2^{N}-dimensional`` stays in the prose; a sentence-final ``.`` stays a
+    period). Never lets the core become empty of a real math token.
+    """
+    danglers = set("+-=*/.~:;,() ") | set(_LATEX_SPACES)
+    head = ""
+    tail = ""
+    while run and run[-1] in danglers and _run_has_core(run[:-1]):
+        tail = run[-1] + tail
+        run = run[:-1]
+    # a trailing unbalanced closing brace (kept its opener outside the run)
+    while run and run[-1] == "}" and run.count("{") < run.count("}"):
+        tail = run[-1] + tail
+        run = run[:-1]
+    while run and run[0] in "()+ " and _run_has_core(run[1:]):
+        head = run[0] + head
+        run = run[1:]
+    return run, head, tail
+
+
+def _run_has_core(run: str) -> bool:
+    return bool(re.search(r"\\[a-zA-Z]|[A-Za-z0-9]", run))
+
+
+def _wrap_latex_in_text(text: str) -> tuple:
+    r"""Wrap every undelimited math run in $...$; return (new_text, n_runs).
+
+    Text already inside $...$/$$..$$/\(..\)/\[..\] is protected and never
+    touched, which also makes the pass idempotent. Never raises.
+    """
+    if not text:
+        return text, 0
+    try:
+        protected = [False] * len(text)
+        for m in _LATEX_PROTECTED_RE.finditer(text):
+            for k in range(m.start(), m.end()):
+                protected[k] = True
+        out = []
+        i = 0
+        n = len(text)
+        wrapped = 0
+        while i < n:
+            if protected[i]:
+                j = i
+                while j < n and protected[j]:
+                    j += 1
+                out.append(text[i:j])
+                i = j
+                continue
+            s = _math_run_start(text, i, protected)
+            if s < 0:
+                out.append(text[i])
+                i += 1
+                continue
+            e = _math_run_extent(text, max(s, i), protected)
+            run, head, tail = _trim_math_run(text[s:e])
+            if not run or not _run_has_core(run):
+                out.append(text[i])
+                i += 1
+                continue
+            if s < i:
+                # absorbed base/brace/ket char was already appended
+                out.pop()
+            out.append(head + "$" + run + "$" + tail)
+            wrapped += 1
+            i = max(e, i + 1)
+        return ("".join(out), wrapped) if wrapped else (text, 0)
+    except Exception:
+        return text, 0
+
+
+def _wrap_undelimited_latex(report: ResearchReport) -> int:
+    """Wrap undelimited LaTeX runs in every span/item/cell/block text and in
+    the executive summary, in place. Logs a WARNING (before/after snippets)
+    for each modified text. Returns the number of modified texts; never
+    raises. Model-agnostic: catches whatever math a model leaks into prose.
+    """
+    changed = 0
+    try:
+        for idx, para in enumerate(report.report.executive_summary or []):
+            if isinstance(para, str):
+                new, k = _wrap_latex_in_text(para)
+                if k:
+                    logger.warning(
+                        "wrapped %d undelimited LaTeX run(s) in exec summary (before: %s | after: %s)",
+                        k,
+                        _snip(para, 50),
+                        _snip(new, 50),
+                    )
+                    report.report.executive_summary[idx] = new
+                    changed += 1
+        for section in report.report.sections:
+            for block in section.blocks or []:
+                for target in [
+                    *(block.spans or []),
+                    *(block.items or []),
+                    *(c for row in (block.rows or []) for c in (row or [])),
+                ]:
+                    new, k = _wrap_latex_in_text(target.text or "")
+                    if k:
+                        logger.warning(
+                            "wrapped %d undelimited LaTeX run(s) in span (before: %s | after: %s)",
+                            k,
+                            _snip(target.text, 50),
+                            _snip(new, 50),
+                        )
+                        target.text = new
+                        changed += 1
+                new, k = _wrap_latex_in_text(block.text or "")
+                if k:
+                    logger.warning(
+                        "wrapped %d undelimited LaTeX run(s) in block text (before: %s | after: %s)",
+                        k,
+                        _snip(block.text, 50),
+                        _snip(new, 50),
+                    )
+                    block.text = new
+                    changed += 1
     except Exception:
         pass
     return changed

@@ -157,7 +157,14 @@ def test_extra_body_thinking_suppressed_by_default(monkeypatch):
     """run_model sends chat_template_kwargs.enable_thinking=False by default
     (config default), coexisting with — not clobbering — reasoning.effort."""
     client = _install(monkeypatch, "ok")
-    run_model(instructions="x", input_data="y", model="m", reasoning_effort="low")
+    # Hermetic: the project var.env may set LLM_ENABLE_THINKING for live
+    # experiments; force the code default under test.
+    monkeypatch.setenv("LLM_ENABLE_THINKING", "false")
+    model_runner.reset_config()
+    try:
+        run_model(instructions="x", input_data="y", model="m", reasoning_effort="low")
+    finally:
+        model_runner.reset_config()
     call = client.calls[0]
     assert call["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
     assert call["reasoning"] == {"effort": "low"}

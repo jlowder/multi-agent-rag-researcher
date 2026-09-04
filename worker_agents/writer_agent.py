@@ -316,11 +316,20 @@ CONTRACT — all of these are mandatory:
    transition spans get citations [].
 6. Use at least 2 blocks per section (a subsection heading is encouraged).
    Do NOT include the section's own title as a heading block — the title is
-   carried by the `heading` field. Include subsection heading blocks only
-   for subsections you actually write.
+   carried by the `heading` field. Include a subsection heading block ONLY
+   for a subsection you actually write: every heading must be followed by at
+   least 2 sentences of body content in the blocks that come after it. If
+   you cannot write at least 2 sentences for a subsection, omit the heading
+   and fold the material into the surrounding prose.
 
 Example of one paragraph block with per-sentence citation spans:
 {"type":"paragraph","spans":[{"text":"Grid-scale deployment rose sharply","citations":[]},{"text":"in several major electricity markets","citations":["D1","W2"]},{"text":"through 2024","citations":["D1"]}]}
+
+Example of a subsection with inline math — mirror this exact shape (every
+formula delimited in $...$, prose words and citations outside the math, and
+the heading followed by real body content):
+{"type":"heading","level":3,"text":"Growth of the error term"},
+{"type":"paragraph","spans":[{"text":"The recursion yields the bound ","citations":[]},{"text":"$T(n) = 2T(n/2) + n \\log n$","citations":["D1"]},{"text":"so the total cost is $O(n \\log n)$ for balanced inputs","citations":["D1"]},{"text":"and $O(n^2)$ for skewed ones","citations":["W2"]}]}
 """ + _MATH_RULES_JSON
 
 

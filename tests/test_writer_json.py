@@ -765,3 +765,26 @@ def test_invalid_content_discard_still_warns(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "WARNING" in out
     assert "kept 1 of 2" in out
+
+
+def test_prompt_has_complete_inline_math_fewshot():
+    """A complete mixed prose+LaTeX example (H3 + body) must be in the prompt,
+    with math delimited and citations attached, next to the math rules."""
+    from worker_agents.writer_agent import WRITE_SECTION_JSON_INSTRUCTIONS as p
+
+    assert "$T(n) = 2T(n/2) + n \\log n$" in p
+    assert "$O(n \\log n)$" in p
+    assert '"type":"heading","level":3,"text":"Growth of the error term"' in p
+    # the few-shot body cites the math and the math rules follow the example
+    assert p.index("Growth of the error term") < p.index("MATH")
+    # math rules remain present after the few-shot
+    assert "Inline math: use $...$" in p
+
+
+def test_prompt_rule6_requires_body_under_subsection_headings():
+    from worker_agents.writer_agent import WRITE_SECTION_JSON_INSTRUCTIONS as p
+
+    assert "at\n   least 2 sentences of body content" in p or (
+        "least 2 sentences of body content" in p
+    )
+    assert "omit the heading" in p
