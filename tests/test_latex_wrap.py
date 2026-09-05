@@ -7,6 +7,7 @@ captured into math.
 """
 
 from deep_research_structured import (
+    _heal_malformed_math_regions,
     _wrap_latex_in_text,
     _wrap_undelimited_latex,
 )
@@ -267,3 +268,102 @@ def test_ket_idempotent_and_mixed_prose():
     assert a == b
     assert "$|\\phi\\rangle$" in a
     assert " apply U, then measure in the computational basis." in a
+
+
+# ---------------------------------------------------------------------------
+# post-wrap validity gate (_heal_malformed_math_regions)
+# ---------------------------------------------------------------------------
+
+BELL = (
+    "A concrete illustration is the Bell state $\\ket{\\Phi^+}="
+    "\\frac{1}{\\sqrt{2}}\\bigl(|00\\rangle+|11\\rangle\\bigr$) is maximal."
+)
+BASIS = (
+    "Specifying a basis \\{$|\\psi_k\\rangle\\}_{k=1}^{d_1d_2$} and assigning "
+    "each basis vector to a subsystem."
+)
+KRAUS = (
+    "The maps must satisfy K'_i = $\\sum_{j} V_{$ij} K_j, yielding the "
+    "same quadratic form."
+)
+
+
+def test_gate_bell_dangling_bigr_heals_to_raw():
+    out, n = _heal_malformed_math_regions(BELL)
+    assert n == 1
+    assert "$" not in out
+    assert "\\bigl(|00\\rangle+|11\\rangle\\bigr)" in out  # raw, parens kept
+
+
+def test_gate_basis_escaped_brace_unbalanced_heals_to_raw():
+    out, n = _heal_malformed_math_regions(BASIS)
+    assert n == 1
+    assert "$" not in out
+    assert "^{d_1d_2} and assigning" in out  # raw text, delimiters stripped
+
+
+def test_gate_kraus_unclosed_brace_heals_to_raw():
+    out, n = _heal_malformed_math_regions(KRAUS)
+    assert n == 1
+    assert "$" not in out
+    assert "\\sum_{j} V_{ij} K_j" in out
+
+
+def test_gate_nested_dollar_resolves_no_double():
+    out, n = _heal_malformed_math_regions("val $$a$ b$ end")
+    assert n >= 1
+    assert "$$" not in out
+    assert "$" not in out
+    assert "val a b end" in out
+
+
+def test_gate_valid_left_right_equation_kept():
+    text = (
+        "The bound $\\left(\\sum_{j=0}^{t} 3^{j}\\binom{n}{j}\\right)2^{k}"
+        "\\leq 2^{n}$ is tight."
+    )
+    out, n = _heal_malformed_math_regions(text)
+    assert n == 0
+    assert out == text  # byte-identical — a good equation must survive
+
+
+def test_gate_valid_ket_and_simple_regions_kept():
+    for text in (
+        "Prepare $|\\psi\\rangle$ now.",
+        "A $2^{N}$-dimensional space.",
+        "Here $S_A=S_B$ exactly.",
+    ):
+        out, n = _heal_malformed_math_regions(text)
+        assert n == 0
+        assert out == text
+
+
+def test_gate_idempotent():
+    once, n1 = _heal_malformed_math_regions(BELL)
+    twice, n2 = _heal_malformed_math_regions(once)
+    assert twice == once
+    assert n2 == 0
+
+
+def test_full_pass_heals_model_emitted_malformed_regions():
+    """Model-emitted malformed $..$ (wrap is a no-op on them) must still be
+    healed to clean raw text by the report-level pass."""
+    report = _report(_para(BELL), _para(BASIS), _para(KRAUS))
+    _wrap_undelimited_latex(report)
+    texts = [s.text for b in report.report.sections[0].blocks for s in b.spans]
+    assert all("$" not in t for t in texts)
+
+
+def test_full_pass_keeps_good_wraps_and_idempotent():
+    report = _report(
+        _para("Prepare |\\psi\\rangle in a $2^{N}$-dimensional space."),
+        _para("Here $S_A=S_B$ exactly and $\\alpha$ decays."),
+    )
+    _wrap_undelimited_latex(report)
+    texts = [s.text for b in report.report.sections[0].blocks for s in b.spans]
+    assert "$|\\psi\\rangle$" in texts[0]        # still wrapped, not healed
+    assert "$2^{N}$" in texts[0]
+    assert "$S_A=S_B$" in texts[1]               # model's valid region kept
+    _wrap_undelimited_latex(report)              # second pass: no churn
+    texts2 = [s.text for b in report.report.sections[0].blocks for s in b.spans]
+    assert texts2 == texts

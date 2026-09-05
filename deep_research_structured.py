@@ -644,6 +644,19 @@ _LATEX_SPACES = " \u00a0\u2007\u2009\u202f"
 _LANGLE = "\\langle"
 _RANGLE = "\\rangle"
 
+# Delimiter commands for the post-wrap validity gate
+# (_heal_malformed_math_regions). The trailing (?![a-zA-Z]) guard excludes
+# longer commands sharing the prefix (\leftarrow, \rightleftharpoons, …).
+_MATH_LEFTY_RE = re.compile(r"\\(?:left|[Bb]igl)(?![a-zA-Z])")
+_MATH_RIGHTY_RE = re.compile(r"\\(?:right|[Bb]igr)(?![a-zA-Z])")
+_MATH_LANGLE_RE = re.compile(r"\\(?:langle|lvert)(?![a-zA-Z])")
+_MATH_RANGLE_RE = re.compile(r"\\(?:rangle|rvert)(?![a-zA-Z])")
+# A sizer command sitting at the end of a region body with no delimiter
+# argument after it (…\bigr, …\left) — KaTeX: "Expected group as argument".
+_MATH_SIZER_END_RE = re.compile(
+    r"\\(?:left|right|[Bb]igl|[Bb]igr|[Bb]igg)\s*(?:[.,;:!?]*)\s*$"
+)
+
 # Max distance (chars) between a ket/bra opener and its closing delimiter.
 # Bounds the search so a lone prose `|` can never swallow the rest of a span.
 _KET_UNIT_WINDOW = 64
@@ -927,6 +940,114 @@ def _wrap_latex_in_text(text: str) -> tuple:
         return text, 0
 
 
+def _unbalanced_braces(body: str) -> bool:
+    """True when unescaped { / } are unbalanced. \\{ and \\} are escaped
+    content in KaTeX (they don't form groups), so they don't count; a
+    negative depth or non-zero final depth is unbalanced."""
+    depth = 0
+    esc = False
+    for ch in body:
+        if esc:
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth < 0:
+                return True
+    return depth != 0 or esc
+
+
+def _region_malformed(body: str, display: bool, close_display: bool) -> bool:
+    r"""Structural gate for one $…$ / $$..$$ region body (assumed terminated).
+
+    Malformed = any of: unbalanced unescaped braces; a nested $; a display/
+    inline delimiter mismatch; a \left/\bigl/\langle/\lvert with no matching
+    close in the same region; or a sizer command ending the body with no
+    delimiter argument (\bigr at end of input)."""
+    if display != close_display:
+        return True
+    if "$" in body:
+        return True
+    if _unbalanced_braces(body):
+        return True
+    if len(_MATH_LEFTY_RE.findall(body)) > len(_MATH_RIGHTY_RE.findall(body)):
+        return True
+    if len(_MATH_LANGLE_RE.findall(body)) > len(_MATH_RANGLE_RE.findall(body)):
+        return True
+    m = _MATH_SIZER_END_RE.search(body)
+    if m and (m.start() == 0 or body[m.start() - 1] not in "()[]|/{}"):
+        return True
+    return False
+
+
+def _heal_malformed_math_regions(text: str) -> tuple:
+    """Undo (strip the delimiters of) every malformed $..$ / $$..$$ region.
+
+    The LaTeX wrap pass and models can both emit regions KaTeX cannot parse
+    (unbalanced braces, a nested $, a lone $, an unmatched or argument-less
+    sizer). Each such region is reverted to its raw body — the safe worst
+    case, since a raw equation at least never breaks the PDF. Well-formed
+    regions pass through byte-identical; the pass is idempotent and never
+    raises. Returns (healed_text, n_regions_healed).
+    """
+    if not text or "$" not in text:
+        return text, 0
+    try:
+        healed = 0
+        for _ in range(8):
+            out = []
+            i = 0
+            n = len(text)
+            fixed = 0
+            while i < n:
+                j = text.find("$", i)
+                if j == -1:
+                    out.append(text[i:])
+                    break
+                esc = 0
+                while j - esc - 1 >= 0 and text[j - esc - 1] == "\\":
+                    esc += 1
+                if esc % 2:
+                    out.append(text[i:j + 1])  # escaped \$ — content
+                    i = j + 1
+                    continue
+                display = text[j:j + 2] == "$$"
+                k = j + (2 if display else 1)
+                t = text.find("$", k)
+                if t == -1:
+                    # (iii) lone opener: strip it, keep the tail raw
+                    out.append(text[i:j] + text[k:])
+                    fixed += 1
+                    break
+                esc2 = 0
+                while t - esc2 - 1 >= 0 and text[t - esc2 - 1] == "\\":
+                    esc2 += 1
+                if esc2 % 2:
+                    out.append(text[i:t + 1])  # escaped closing — content
+                    i = t + 1
+                    continue
+                close_display = text[t:t + 2] == "$$"
+                e = t + (2 if close_display else 1)
+                body = text[k:t]
+                if _region_malformed(body, display, close_display):
+                    out.append(text[i:j] + body + text[e:])
+                    fixed += 1
+                    i = e
+                else:
+                    out.append(text[i:e])
+                    i = e
+            if not fixed:
+                break
+            text = "".join(out)
+            healed += fixed
+        return text, healed
+    except Exception:
+        return text, 0
+
+
 def _wrap_undelimited_latex(report: ResearchReport) -> int:
     """Wrap undelimited LaTeX runs in every span/item/cell/block text and in
     the executive summary, in place. Logs a WARNING (before/after snippets)
@@ -947,6 +1068,17 @@ def _wrap_undelimited_latex(report: ResearchReport) -> int:
                     )
                     report.report.executive_summary[idx] = new
                     changed += 1
+                healed, h = _heal_malformed_math_regions(
+                    report.report.executive_summary[idx]
+                )
+                if h:
+                    logger.info(
+                        "healed %d malformed math region(s) in exec summary (after: %s)",
+                        h,
+                        _snip(healed, 50),
+                    )
+                    report.report.executive_summary[idx] = healed
+                    changed += 1
         for section in report.report.sections:
             for block in section.blocks or []:
                 for target in [
@@ -964,6 +1096,15 @@ def _wrap_undelimited_latex(report: ResearchReport) -> int:
                         )
                         target.text = new
                         changed += 1
+                    healed, h = _heal_malformed_math_regions(target.text or "")
+                    if h:
+                        logger.info(
+                            "healed %d malformed math region(s) in span (after: %s)",
+                            h,
+                            _snip(healed, 50),
+                        )
+                        target.text = healed
+                        changed += 1
                 new, k = _wrap_latex_in_text(block.text or "")
                 if k:
                     logger.warning(
@@ -973,6 +1114,15 @@ def _wrap_undelimited_latex(report: ResearchReport) -> int:
                         _snip(new, 50),
                     )
                     block.text = new
+                    changed += 1
+                healed, h = _heal_malformed_math_regions(block.text or "")
+                if h:
+                    logger.info(
+                        "healed %d malformed math region(s) in block text (after: %s)",
+                        h,
+                        _snip(healed, 50),
+                    )
+                    block.text = healed
                     changed += 1
     except Exception:
         pass
