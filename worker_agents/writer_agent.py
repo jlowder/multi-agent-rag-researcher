@@ -39,9 +39,18 @@ KaTeX). These rules are mandatory:
 - Use LaTeX commands, never Unicode: \\frac{a}{b}, \\sqrt{}, \\sum, \\int,
   ^{} for superscripts, _{} for subscripts, \\dot{x}, \\le, \\approx,
   \\alpha. NEVER emit Unicode super/subscripts or math symbols in prose
-  (x², y₀, ẋ, ⁿ, ≤, ≈).
+  (x², y₀, ẋ, ⁿ, ≤, ≈). NEVER emit combining-mark/diacritic characters (a
+  literal overline/underline mark) — use LaTeX commands: \\hat{x}, \\bar{p},
+  \\overline{x}, \\vec{v}.
 - Explanatory prose (what each symbol means) stays in normal span text
   outside the math delimiters, with its citations as usual.
+EXAMPLES (follow these exactly):
+- An equation block is ONE bare-LaTeX formula — never wrap parts in $...$:
+  {"type":"equation","text":"F(\\psi, \\rho) = \\operatorname{Tr}[\\psi \\rho]","language":"latex"}
+  WRONG: "F($\\psi, \\rho$)"  RIGHT: "F(\\psi, \\rho)".
+- Inline math in prose uses $...$:
+  "The canonical commutator is $[\\hat{x}, \\hat{p}] = i\\hbar$, a cornerstone of quantum mechanics."
+  WRONG: undelimited "\\alpha|\\psi\\rangle" in prose  RIGHT: "$\\alpha|\\psi\\rangle$".
 """
 
 # Markdown-mode variant of the same rules: display math is a standalone
